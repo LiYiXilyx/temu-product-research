@@ -1,0 +1,31 @@
+{
+  "name": "temu-week1-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "init": "node src/cli.mjs init --config config.json",
+    "dashboard": "node src/dashboard-server.mjs",
+    "capture": "node src/cli.mjs capture --config config.json",
+    "current-review": "node src/cli.mjs current-review --config config.json",
+    "refresh": "node src/cli.mjs refresh --config config.json",
+    "crawl": "node src/cli.mjs crawl --config config.json",
+    "reviews": "node src/cli.mjs reviews --config config.json --batch-size 10",
+    "reviews:retry": "node src/cli.mjs reviews --config config.json --batch-size 10 --retry-failed",
+    "import:live": "node tools/import-live-products.mjs config.json outputs/week1-mvp/live-products-100.json",
+    "import:reviews": "node tools/import-live-reviews.mjs config.json outputs/week1-mvp/live-reviews-first-batch.json",
+    "fix:top-sales": "node tools/migrate-top-sales.mjs config.json",
+    "export": "node tools/build-report.mjs --config config.json",
+    "export:qa": "node tools/build-report.mjs --config config.json --render",
+    "demo": "node src/cli.mjs demo --config config.json && node tools/build-report.mjs --config config.json",
+    "test": "node --test",
+    "check": "node --check src/cli.mjs && node --check src/crawler.mjs && node --check src/database.mjs && node --check src/dashboard-server.mjs && node --check ui/app.js && node --check tools/build-report.mjs && node --check tools/import-live-products.mjs && node --check tools/import-live-reviews.mjs && node --check tools/migrate-top-sales.mjs"
+  },
+  "dependencies": {
+    "@oai/artifact-tool": ">=2.8.6",
+    "playwright": ">=1.56.0"
+  }
+}

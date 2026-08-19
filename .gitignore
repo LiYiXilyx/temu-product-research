@@ -1,0 +1,16 @@
+node_modules/
+browser-profile*/
+data/
+output/
+outputs/
+config.json
+.env
+.env.*
+*.log
+*.db
+*.sqlite*
+*.xlsx
+playwright-report/
+test-results/
+.artifact-work/
+.docx-review/

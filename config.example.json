@@ -1,0 +1,63 @@
+{
+  "siteCountry": "德国",
+  "language": "en",
+  "currency": "EUR",
+  "exchangeRateRmb": 8,
+  "targetCount": 100,
+  "databasePath": "./data/temu_week1.db",
+  "outputDir": "./outputs/week1-mvp",
+  "profileDir": "./browser-profile",
+  "browser": {
+    "headless": false,
+    "executablePath": "",
+    "cdpEndpoint": "",
+    "launchViaCdp": true,
+    "debugPort": 9227,
+    "pauseBeforeStart": true,
+    "minimumDelayMs": 1500,
+    "manualRetryLimit": 8,
+    "maxStaleRounds": 6,
+    "maxReviewPages": 20,
+    "saveSnapshots": true
+  },
+  "selectionRules": {
+    "minPriceEur": 5,
+    "minRating": 4.6,
+    "minRecentDailyReviews": 3,
+    "excludeElectronic": true,
+    "excludeUsb": true,
+    "electronicTerms": [
+      "battery", "rechargeable", "bluetooth", "wireless", "charger", "electronic",
+      "lithium", "led light", "电池", "充电", "蓝牙", "无线", "电子"
+    ],
+    "usbTerms": ["usb", "type-c", "type c"]
+  },
+  "reviewAnalysis": {
+    "negativeMaxRating": 3,
+    "pilotBatchSize": 10,
+    "minimumPilotSuccess": 8,
+    "pilotFullHistory": true,
+    "fastGrowthRatio": 1.5
+  },
+  "jobs": [
+    {
+      "url": "PASTE_TEMU_CATEGORY_URL_AFTER_SETTING_GERMANY_ENGLISH_EUR_TOP_SALES",
+      "primaryCategory": "Automotive",
+      "subcategory": "请填写子类目",
+      "sortOrder": "Top Sales",
+      "searchQuery": "motorcycle parts",
+      "targetCount": 100
+    }
+  ],
+  "selectors": {
+    "productLinks": "a[href*='goods.html'], a[href*='/g-']",
+    "productCard": "[data-testid*='product'], [class*='product-card'], [class*='ProductCard'], li",
+    "reviewOpen": "button:has-text('See all reviews'), button:has-text('View all reviews'), button:has-text('All reviews'), [role='button']:has-text('See all reviews'), [role='button']:has-text('View all reviews')",
+    "reviewSort": "button:has-text('Most recent'), [role='button']:has-text('Most recent'), [role='option']:has-text('Most recent')",
+    "reviewCard": "[data-testid*='review-item'], [data-testid*='comment-item'], [class*='reviewItem'], [class*='review-item'], [class*='commentItem'], [class*='comment-item']",
+    "reviewDate": "time, [class*='date'], [data-testid*='date']",
+    "reviewText": "[data-testid*='review-content'], [class*='review-content'], [class*='reviewContent'], [class*='comment-content'], [class*='commentContent']",
+    "reviewRating": "[aria-label*='out of 5'], [aria-label*='star'], [class*='star']",
+    "reviewLoadMore": "button:has-text('Load more'), button:has-text('Show more')"
+  }
+}

@@ -1,0 +1,1259 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import { spawn } from 'node:child_process';
+import { stdin as input, stdout as output } from 'node:process';
+import { chromium } from 'playwright';
+import { canonicalProductUrl, classifyTemuProductPage, cleanTemuReviewText, daysAgoIso, normalizeSpace, parseCompactNumber, parsePrice, parseRating, parseReviewDate } from './parsers.mjs';
+import { evaluateSelection, summarizeNegativeReviews } from './analysis.mjs';
+import {
+  finishRun,
+  getActiveProductByUrl,
+  getReviewCrawlSummary,
+  getReviewsForProduct,
+  listReviewCrawlCandidates,
+  markReviewCrawlFinished,
+  markReviewCrawlStarted,
+  recordError,
+  replaceActiveCatalog,
+  startRun,
+  updateProductAnalysis,
+  updateReviewCrawlCheckpoint,
+  upsertProduct,
+  upsertReviews
+} from './database.mjs';
+
+const CHALLENGE_PATTERN = /captcha|verify you are human|security verification|slide to verify|验证码|安全验证/i;
+const LOGIN_PATTERN = /sign in\s*\/\s*register|email or phone number|登录|注册/i;
+const BLOCKER_URL_PATTERN = /\/(?:bgn_verification|login)\.html/i;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function randomInteger(minimum, maximum) {
+  const low = Math.ceil(Math.min(minimum, maximum));
+  const high = Math.floor(Math.max(minimum, maximum));
+  return Math.floor(Math.random() * (high - low + 1)) + low;
+}
+
+async function humanDelay(config) {
+  await sleep(randomInteger(config.browser.minimumDelayMs, config.browser.maximumDelayMs));
+}
+
+function configuredCdpEndpoint(config) {
+  return config.browser.cdpEndpoint || `http://127.0.0.1:${Number(config.browser.debugPort ?? 9227)}`;
+}
+
+async function navigateTemu(page, url) {
+  try {
+    return await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  } catch (error) {
+    const currentUrl = page.url();
+    const redirectedInsideTemu = /net::ERR_ABORTED/i.test(error?.message ?? '')
+      && /^https:\/\/(?:www\.)?temu\.com\//i.test(currentUrl);
+    if (!redirectedInsideTemu) throw error;
+    await page.waitForTimeout(1_000);
+    return null;
+  }
+}
+
+async function promptEnter(message) {
+  const prompt = readline.createInterface({ input, output });
+  await prompt.question(message);
+  prompt.close();
+}
+
+async function findInstalledBrowser(config) {
+  const configured = config.browser.executablePath;
+  if (configured) {
+    const executablePath = path.resolve(configured);
+    await fs.access(executablePath).catch(() => {
+      throw new Error(`browser.executablePath 不存在：${executablePath}`);
+    });
+    return executablePath;
+  }
+  const candidates = [
+    path.join(process.env.LOCALAPPDATA ?? '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {}
+  }
+  throw new Error('未找到Google Chrome。请在 config.json 的 browser.executablePath 中填写 chrome.exe 的完整路径。');
+}
+
+async function openContext(config) {
+  if (config.browser.cdpEndpoint) {
+    const browser = await chromium.connectOverCDP(config.browser.cdpEndpoint);
+    const context = browser.contexts()[0];
+    if (!context) throw new Error('CDP已连接，但没有可用浏览器上下文。');
+    return { browser, context, persistent: false };
+  }
+  await fs.mkdir(config.profileDir, { recursive: true });
+  const executablePath = await findInstalledBrowser(config);
+  console.log(`使用Google Chrome：${executablePath}`);
+  if (config.browser.launchViaCdp) {
+    const debugPort = Number(config.browser.debugPort ?? 9227);
+    const endpoint = `http://127.0.0.1:${debugPort}`;
+    let chromeProcess = null;
+    let endpointReady = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(800) })
+      .then(response => response.ok).catch(() => false);
+    if (!endpointReady) {
+      chromeProcess = spawn(executablePath, [
+        `--remote-debugging-port=${debugPort}`,
+        '--remote-debugging-address=127.0.0.1',
+        `--user-data-dir=${config.profileDir}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--new-window',
+        'about:blank'
+      ], { detached: false, stdio: 'ignore', windowsHide: false });
+      for (let attempt = 0; attempt < 30 && !endpointReady; attempt += 1) {
+        await sleep(500);
+        endpointReady = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(800) })
+          .then(response => response.ok).catch(() => false);
+        if (chromeProcess.exitCode != null) break;
+      }
+    }
+    if (!endpointReady) {
+      chromeProcess?.kill();
+      throw new Error(`普通Chrome已启动，但无法连接本地调试端口 ${debugPort}。请关闭其他采集Chrome后重试。`);
+    }
+    const browser = await chromium.connectOverCDP(endpoint);
+    const context = browser.contexts()[0];
+    if (!context) throw new Error('普通Chrome已连接，但没有可用浏览器上下文。');
+    return { browser, context, persistent: false, chromeProcess };
+  }
+  const context = await chromium.launchPersistentContext(config.profileDir, {
+    executablePath,
+    headless: Boolean(config.browser.headless),
+    chromiumSandbox: true,
+    timeout: 30_000,
+    args: ['--disable-gpu', '--disable-gpu-shader-disk-cache'],
+    locale: 'en-DE',
+    viewport: { width: 1440, height: 900 }
+  });
+  return { browser: null, context, persistent: true };
+}
+
+async function openExistingOperatorContext(config) {
+  const endpoint = configuredCdpEndpoint(config);
+  const endpointReady = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_000) })
+    .then(response => response.ok).catch(() => false);
+  if (!endpointReady) {
+    throw new Error('采集 Chrome 尚未连接。请先在运营台点击“打开采集 Chrome”，完成登录、类目和排序设置后再采集。');
+  }
+  const browser = await chromium.connectOverCDP(endpoint);
+  const context = browser.contexts()[0];
+  if (!context) {
+    await browser.close().catch(() => {});
+    throw new Error('采集 Chrome 已连接，但没有可用页面。请先打开 Temu 摩托配件商品列表。');
+  }
+  return { browser, context, persistent: false };
+}
+
+async function closeSession(session) {
+  if (!session) return;
+  if (session.persistent) await session.context.close().catch(() => {});
+  else if (session.browser) await session.browser.close().catch(() => {});
+  if (session.chromeProcess && session.chromeProcess.exitCode == null) session.chromeProcess.kill();
+}
+
+async function handleChallenge(page, config, label) {
+  let prompted = false;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+    const currentUrl = page.url();
+    const frameUrls = page.frames().map(frame => frame.url());
+    const verificationRequired = await hasVisibleText(page, CHALLENGE_PATTERN)
+      || BLOCKER_URL_PATTERN.test(currentUrl)
+      || frameUrls.some(url => /\/bgn_verification\.html/i.test(url));
+    const loggedInEvidence = /Orders\s*&\s*Account|Hello\s*[,，]/i.test(body);
+    const loginFormVisible = await page.locator("input[type='password'], input[autocomplete='username'], input[autocomplete='current-password']")
+      .first().isVisible().catch(() => false);
+    const loginRequired = /\/login\.html/i.test(currentUrl)
+      || (!loggedInEvidence && (loginFormVisible || await hasVisibleText(page, LOGIN_PATTERN)));
+    if (!verificationRequired && !loginRequired) return prompted;
+    if (config.browser.headless) {
+      throw new Error(`${label}检测到登录或人工验证；请改为headless=false后人工处理。`);
+    }
+    await promptEnter(`${label}需要登录或安全验证。请在采集浏览器中完成后按 Enter 继续（程序不会绕过验证）：`);
+    prompted = true;
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error(`${label}在多次人工确认后仍停留在登录或安全验证页面。`);
+}
+
+async function hasVisibleText(page, pattern) {
+  const matches = page.getByText(pattern);
+  const count = Math.min(await matches.count().catch(() => 0), 20);
+  for (let index = 0; index < count; index += 1) {
+    if (await matches.nth(index).isVisible().catch(() => false)) return true;
+  }
+  return false;
+}
+
+async function hasProductLinks(page, config) {
+  return (await page.locator(config.selectors.productLinks).count().catch(() => 0)) > 0;
+}
+
+async function isGoneListingPage(page) {
+  return hasVisibleText(page, /Oops!?\s*The items? (?:are|is) gone|Try again to find items/i);
+}
+
+function regexLiteral(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function discoverCurrentListing(page, config, job) {
+  const homeUrl = new URL('/', job.url).toString();
+  console.log('配置中的类目地址已失效，正在从Temu当前页面重新定位摩托配件类目。');
+  await navigateTemu(page, homeUrl);
+  await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+  await handleChallenge(page, config, '重新定位类目');
+  const homeProblem = await resolveTransientProductProblem(page, config, '重新定位类目：', homeUrl);
+  if (homeProblem && !homeProblem.permanent) throw new Error(homeProblem.message);
+  if (!homeProblem && !await isGoneListingPage(page) && await hasProductLinks(page, config)) {
+    console.log(`已采用人工恢复后的当前商品列表：${page.url()}`);
+    return page.url();
+  }
+
+  const categoryTrigger = page.getByText(/^Categories$/i);
+  await hoverIfVisible(categoryTrigger);
+  await page.waitForTimeout(500);
+  if (!await hasVisibleText(page, new RegExp(`^${regexLiteral(job.primaryCategory)}$`, 'i'))) {
+    await clickIfVisible(categoryTrigger);
+    await page.waitForTimeout(700);
+  }
+  const primaryCategory = page.getByText(new RegExp(`^${regexLiteral(job.primaryCategory)}$`, 'i'));
+  await hoverIfVisible(primaryCategory);
+  await page.waitForTimeout(700);
+  const subcategory = page.getByText(/Motorcycles\s*&\s*Powerspor/i);
+  const clickedSubcategory = await clickIfVisible(subcategory);
+  if (clickedSubcategory) {
+    await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+    await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+    await handleChallenge(page, config, '重新定位类目');
+    if (!await isGoneListingPage(page) && await hasProductLinks(page, config)) {
+      console.log(`已重新定位当前类目：${page.url()}`);
+      return page.url();
+    }
+  }
+  await saveSnapshot(page, config, 'catalog-discovery-menu').catch(() => {});
+
+  const searchQuery = job.searchQuery || 'motorcycle parts';
+  const searchUrl = new URL(`/search_result.html?search_key=${encodeURIComponent(searchQuery)}&search_method=user`, job.url).toString();
+  console.log(`类目菜单未返回可用列表，改用关键词“${searchQuery}”定位当前在售商品。`);
+  await navigateTemu(page, searchUrl);
+  await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+  await handleChallenge(page, config, '摩托配件搜索页');
+  const searchProblem = await resolveTransientProductProblem(page, config, '摩托配件搜索页：', searchUrl);
+  if (searchProblem && !searchProblem.permanent) throw new Error(searchProblem.message);
+  await page.locator(config.selectors.productLinks).first().waitFor({ state: 'attached', timeout: 30_000 }).catch(() => {});
+  if (await isGoneListingPage(page) || !await hasProductLinks(page, config)) {
+    await saveSnapshot(page, config, 'catalog-discovery-search-failed').catch(() => {});
+    throw new Error('旧类目地址已失效，并且Temu当前菜单及搜索页均未返回摩托配件商品；旧商品池未作任何修改。');
+  }
+  console.log(`已打开当前摩托配件搜索结果：${page.url()}`);
+  return page.url();
+}
+
+async function openJobListing(page, config, job) {
+  await navigateTemu(page, job.url);
+  await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+  await handleChallenge(page, config, '商品池刷新');
+  if (!await isGoneListingPage(page) && await hasProductLinks(page, config)) return page.url();
+  return discoverCurrentListing(page, config, job);
+}
+
+async function collectListingPage(page, config, job) {
+  const selector = config.selectors.productLinks;
+  return page.locator(selector).evaluateAll((anchors, args) => {
+    const unique = new Map();
+    const findProductCard = (anchor) => {
+      let node = anchor;
+      let configuredFallback = null;
+      for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+        if (!configuredFallback && node.matches?.(args.productCard)) configuredFallback = node;
+        const text = String(node.innerText || '');
+        if (node.querySelector?.('img') && /(?:€|EUR)/i.test(text) && /sold/i.test(text)) return node;
+      }
+      return configuredFallback || anchor.parentElement || anchor;
+    };
+    const findProductImage = (card) => {
+      const images = [...card.querySelectorAll('img')].filter((image) => image.currentSrc || image.src);
+      images.sort((left, right) => {
+        const leftItem = /item picture/i.test(left.alt || '') ? 1 : 0;
+        const rightItem = /item picture/i.test(right.alt || '') ? 1 : 0;
+        if (leftItem !== rightItem) return rightItem - leftItem;
+        const leftArea = (left.clientWidth * left.clientHeight * 1_000_000) + (left.naturalWidth * left.naturalHeight);
+        const rightArea = (right.clientWidth * right.clientHeight * 1_000_000) + (right.naturalWidth * right.naturalHeight);
+        return rightArea - leftArea;
+      });
+      return images[0] || null;
+    };
+    for (const anchor of anchors) {
+      const href = anchor.href;
+      if (!href) continue;
+      const card = findProductCard(anchor);
+      const image = findProductImage(card);
+      const text = (card.innerText || anchor.innerText || '').replace(/\s+/g, ' ').trim();
+      const anchorTitle = String(anchor.innerText || '').replace(/\s*Open in new tab\.?\s*$/i, '').trim();
+      const imageTitle = String(image?.alt || '').replace(/^item picture\s*/i, '').trim();
+      const title = anchorTitle || imageTitle || anchor.getAttribute('aria-label') || anchor.title || '';
+      const candidate = { href, title: title.trim(), imageUrl: image?.currentSrc || image?.src || '', cardText: text };
+      const existing = unique.get(href);
+      const quality = (item) => Number(Boolean(item.imageUrl)) + Number(/(?:€|EUR)/i.test(item.cardText)) + Number(/sold/i.test(item.cardText));
+      if (!existing || quality(candidate) > quality(existing)) unique.set(href, candidate);
+    }
+    return [...unique.values()];
+  }, { productCard: config.selectors.productCard, job });
+}
+
+function goodsIdFromProductUrl(productUrl) {
+  const pathMatch = String(productUrl || '').match(/-g-(\d+)\.html/i);
+  if (pathMatch) return pathMatch[1];
+  try {
+    return new URL(productUrl).searchParams.get('goods_id') || '';
+  } catch {
+    return '';
+  }
+}
+
+async function cacheProductImages(page, config, products) {
+  const cacheDir = path.join(config.outputDir, 'image-cache');
+  await fs.mkdir(cacheDir, { recursive: true });
+  const pending = [];
+  let existingCount = 0;
+  for (const product of products) {
+    const goodsId = goodsIdFromProductUrl(product.productUrl);
+    if (!goodsId || !product.imageUrl) continue;
+    const targetPath = path.join(cacheDir, `${goodsId}.png`);
+    const stat = await fs.stat(targetPath).catch(() => null);
+    if (stat?.size > 100) {
+      existingCount += 1;
+      continue;
+    }
+    pending.push({ goodsId, imageUrl: product.imageUrl.replace(/format\/(?:avif|webp)/i, 'format/png'), targetPath });
+  }
+  if (pending.length === 0) {
+    console.log(`商品主图缓存：已存在=${existingCount}，无需新增。`);
+    return;
+  }
+
+  const downloaded = await page.evaluate(async (items) => {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    async function worker() {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const item = items[index];
+        try {
+          const response = await fetch(item.imageUrl);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const blob = await response.blob();
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error || new Error('图片转换失败'));
+            reader.readAsDataURL(blob);
+          });
+          results[index] = { goodsId: item.goodsId, base64: dataUrl.split(',')[1] || '' };
+        } catch (error) {
+          results[index] = { goodsId: item.goodsId, error: String(error) };
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, items.length) }, () => worker()));
+    return results;
+  }, pending.map(({ goodsId, imageUrl }) => ({ goodsId, imageUrl })));
+
+  let savedCount = 0;
+  let failedCount = 0;
+  for (const [index, result] of downloaded.entries()) {
+    if (!result?.base64) {
+      failedCount += 1;
+      continue;
+    }
+    const bytes = Buffer.from(result.base64, 'base64');
+    const isPng = bytes.length > 100 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if (!isPng) {
+      failedCount += 1;
+      continue;
+    }
+    await fs.writeFile(pending[index].targetPath, bytes);
+    savedCount += 1;
+  }
+  const firstError = downloaded.find(result => result?.error)?.error;
+  if (failedCount > 0 && firstError) console.warn(`商品主图缓存示例错误：${firstError}`);
+  console.log(`商品主图缓存：新增=${savedCount}，已存在=${existingCount}，失败=${failedCount}。`);
+}
+
+async function ensureTopSalesSort(page, job) {
+  if (!/^top\s*sales$/i.test(normalizeSpace(job.sortOrder))) return;
+  let body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+  if (/Sort by:\s*Top sales/i.test(body)) return;
+
+  const sortTriggers = [
+    "button:has-text('Sort by')",
+    "[role='button']:has-text('Sort by')",
+    "button:has-text('Relevance')",
+    "[role='button']:has-text('Relevance')"
+  ];
+  for (const selector of sortTriggers) {
+    if (await clickIfVisible(page.locator(selector))) break;
+  }
+  await page.waitForTimeout(500);
+  const topSalesOptions = [
+    page.getByRole('option', { name: /Top sales/i }),
+    page.getByText(/^Top sales$/i),
+    page.locator("[role='menuitem']:has-text('Top sales')")
+  ];
+  for (const locator of topSalesOptions) {
+    if (await clickIfVisible(locator)) break;
+  }
+  await page.waitForTimeout(1_000);
+  body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+  if (!/Sort by:\s*Top sales/i.test(body)) {
+    throw new Error('未能确认类目页为 Top sales 排序。请在页面手动选择“Sort by: Top sales”后重试。');
+  }
+}
+
+async function gatherProducts(page, config, job) {
+  const limit = Number(job.targetCount ?? config.targetCount);
+  const found = new Map();
+  let staleRounds = 0;
+  let expansionClicks = 0;
+  let lastExpansionSize = -1;
+  const maxExpansions = Number(config.browser.maxCatalogExpansions ?? 4);
+  await page.evaluate(() => {
+    const scrollingElement = document.scrollingElement || document.documentElement;
+    scrollingElement.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }).catch(() => {});
+  await humanDelay(config);
+  console.log('已回到商品列表顶部，将从第一批开始累计，避免 Temu 虚拟列表漏掉前 40 个商品。');
+  while (found.size < limit && staleRounds < config.browser.maxStaleRounds) {
+    const items = await collectListingPage(page, config, job);
+    const before = found.size;
+    for (const item of items) {
+      const productUrl = canonicalProductUrl(item.href);
+      if (!productUrl || found.has(productUrl)) continue;
+      found.set(productUrl, {
+        productUrl,
+        title: normalizeSpace(item.title),
+        imageUrl: item.imageUrl,
+        priceEur: parsePrice(item.cardText),
+        salesCount: parseCompactNumber(item.cardText.match(/\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s*(?:sold|sales)/i)?.[0]),
+        rating: parseRating(item.cardText.match(/[1-5](?:[.,]\d)?\s*(?:stars?|rating|out of (?:5|five)(?: stars?)?)/i)?.[0]),
+        totalReviewCount: null,
+        siteCountry: config.siteCountry,
+        currency: config.currency,
+        primaryCategory: job.primaryCategory,
+        subcategory: job.subcategory,
+        sortOrder: job.sortOrder,
+        raw: { cardText: item.cardText }
+      });
+    }
+    if (found.size === before && found.size !== lastExpansionSize && expansionClicks < maxExpansions) {
+      const seeMoreName = /^See more(?: items)?$/i;
+      const seeMore = page.locator('.js-category-goodsList').getByRole('button', { name: seeMoreName })
+        .or(page.getByRole('button', { name: seeMoreName }));
+      if (await clickIfVisible(seeMore)) {
+        expansionClicks += 1;
+        lastExpansionSize = found.size;
+        staleRounds = 0;
+        console.log(`已点击 See more（${expansionClicks}/${maxExpansions}），等待加载更多商品…`);
+        await humanDelay(config);
+        await handleChallenge(page, config, '加载更多商品');
+        const problem = await detectProductPageProblem(page, page.url());
+        if (problem && !problem.permanent) throw new Error(`加载更多商品失败：${problem.message}`);
+        continue;
+      }
+    }
+    staleRounds = found.size === before ? staleRounds + 1 : 0;
+    process.stdout.write(`发现商品 ${found.size}/${limit}，连续无新增 ${staleRounds}/${config.browser.maxStaleRounds}\r`);
+    await page.mouse.wheel(0, randomInteger(1700, 3000));
+    await humanDelay(config);
+  }
+  process.stdout.write('\n');
+  if (found.size < limit) console.log(`当前页面共加载 ${found.size} 个商品，未达到目标 ${limit}；没有可继续点击的 See more。`);
+  return [...found.values()].slice(0, limit);
+}
+
+async function findCurrentOperatorTemuPage(context) {
+  const pages = context.pages().filter(page => !page.isClosed());
+  const temuPages = pages.filter(page => {
+    try { return /(^|\.)temu\.com$/i.test(new URL(page.url()).hostname); } catch { return false; }
+  });
+  for (const page of [...temuPages].reverse()) {
+    if (await page.evaluate(() => document.visibilityState === 'visible').catch(() => false)) return page;
+  }
+  return temuPages.at(-1) ?? null;
+}
+
+async function validateCurrentCatalogPage(page, config, job) {
+  await handleChallenge(page, config, '当前商品页');
+  const problem = await detectProductPageProblem(page, page.url());
+  if (problem) throw new Error(`${problem.message} 当前页采集已停止，原商品池未作任何修改。`);
+
+  const body = await page.locator('body').innerText({ timeout: 10_000 }).catch(() => '');
+  const productLinkCount = await page.locator(config.selectors.productLinks).count().catch(() => 0);
+  if (productLinkCount === 0) {
+    throw new Error('当前 Chrome 页面没有发现商品列表。请人工打开 Temu 摩托配件类目或搜索结果，看到商品后再采集。');
+  }
+  const categoryEvidence = `${page.url()} ${body.slice(0, 30_000)}`;
+  if (!/(motorcycl|motocross|powersport)/i.test(categoryEvidence)) {
+    throw new Error('当前页面不能确认是摩托配件商品池。请进入 Motorcycles & Powersports Accessories 后再采集。');
+  }
+  if (/^top\s*sales$/i.test(normalizeSpace(job.sortOrder)) && !/Sort\s*by\s*:?\s*Top\s*sales/i.test(body)) {
+    throw new Error('当前页面尚未确认 Top Sales 排序。请在 Temu 页面手动选择“Sort by: Top sales”，再点击采集。');
+  }
+  console.log(`已确认当前页：${page.url()}`);
+  console.log(`已确认类目：${job.subcategory}；排序：${job.sortOrder}；当前已加载商品链接：${productLinkCount}。`);
+}
+
+async function extractStructuredProduct(page, product) {
+  const data = await page.evaluate(() => {
+    const jsonLd = [];
+    for (const node of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const parsed = JSON.parse(node.textContent || '{}');
+        jsonLd.push(...(Array.isArray(parsed) ? parsed : [parsed]));
+      } catch {}
+    }
+    const candidate = jsonLd.find(item => item?.['@type'] === 'Product') || {};
+    const offer = Array.isArray(candidate.offers) ? candidate.offers[0] : candidate.offers || {};
+    const aggregate = candidate.aggregateRating || {};
+    const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    return {
+      title: candidate.name || document.querySelector('h1')?.textContent || document.querySelector('meta[property="og:title"]')?.content || '',
+      imageUrl: (Array.isArray(candidate.image) ? candidate.image[0] : candidate.image) || document.querySelector('meta[property="og:image"]')?.content || '',
+      priceText: offer.price ? String(offer.price) : bodyText,
+      ratingText: aggregate.ratingValue ? String(aggregate.ratingValue) : bodyText,
+      reviewCountText: aggregate.reviewCount ? String(aggregate.reviewCount) : '',
+      bodyText
+    };
+  });
+  const priceEur = data.priceText === data.bodyText ? parsePrice(data.bodyText) : Number(data.priceText);
+  const rating = data.ratingText === data.bodyText ? parseRating(data.bodyText) : Number(data.ratingText);
+  const totalReviewCount = parseCompactNumber(data.reviewCountText)
+    ?? parseCompactNumber(data.bodyText.match(/\d+(?:[.,]\d+)?\s*[kKmM]?\s*(?:reviews?|ratings?)/i)?.[0]);
+  const salesCount = parseCompactNumber(data.bodyText.match(/\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s*(?:sold|sales)/i)?.[0]);
+  return {
+    ...product,
+    title: normalizeSpace(data.title) || product.title,
+    imageUrl: data.imageUrl || product.imageUrl,
+    priceEur: Number.isFinite(priceEur) ? Number(priceEur.toFixed(2)) : product.priceEur,
+    salesCount: salesCount ?? product.salesCount,
+    rating: Number.isFinite(rating) ? rating : product.rating,
+    totalReviewCount: totalReviewCount ?? product.totalReviewCount,
+    detailText: data.bodyText,
+    raw: { ...product.raw, detailBodyText: data.bodyText.slice(0, 20_000) }
+  };
+}
+
+async function clickIfVisible(locator) {
+  const count = Math.min(await locator.count().catch(() => 0), 12);
+  for (let index = 0; index < count; index += 1) {
+    const candidate = locator.nth(index);
+    if (!await candidate.isVisible().catch(() => false)) continue;
+    const clicked = await candidate.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (clicked) return true;
+  }
+  return false;
+}
+
+async function hoverIfVisible(locator) {
+  const count = Math.min(await locator.count().catch(() => 0), 12);
+  for (let index = 0; index < count; index += 1) {
+    const candidate = locator.nth(index);
+    if (!await candidate.isVisible().catch(() => false)) continue;
+    const hovered = await candidate.hover({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (hovered) return true;
+  }
+  return false;
+}
+
+async function extractReviewCards(page, config) {
+  const primary = await page.locator(config.selectors.reviewCard).evaluateAll((cards, selectors) => cards.map((card, index) => {
+    const dateNode = card.querySelector(selectors.reviewDate);
+    const textNode = card.querySelector(selectors.reviewText);
+    const ratingNode = card.querySelector(selectors.reviewRating);
+    const rawText = (card.innerText || '').replace(/\r/g, '').trim();
+    const regionLabel = [...card.querySelectorAll('[aria-label]')]
+      .map(node => node.getAttribute('aria-label') || '').find(value => /\bin\s+.+\s+on\s+/i.test(value)) || '';
+    return {
+      domId: card.getAttribute('data-review-id') || card.id || '',
+      dateText: dateNode?.getAttribute('datetime') || dateNode?.textContent || regionLabel || '',
+      reviewText: textNode?.textContent || rawText,
+      ratingText: ratingNode?.getAttribute('aria-label') || ratingNode?.textContent || rawText,
+      variant: rawText.match(/Purchased:\s*([^\n]+)/i)?.[1]?.trim() || '',
+      reviewerRegion: regionLabel.match(/\bin\s+(.+?)\s+on\s+/i)?.[1]?.trim() || '',
+      isTranslated: /Review before translation:/i.test(rawText),
+      imageUrls: [...card.querySelectorAll('img[src]')].map(node => node.src)
+        .filter(src => !/avatar|openingemail|upload_aimg\/commodity/i.test(src)).slice(0, 20),
+      rawText,
+      index
+    };
+  }), {
+    reviewDate: config.selectors.reviewDate,
+    reviewText: config.selectors.reviewText,
+    reviewRating: config.selectors.reviewRating
+  });
+  const datePattern = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+20\d{2}\b/i;
+  const plausible = primary.filter(card => datePattern.test(card.dateText || card.rawText));
+  if (plausible.length > 0) return plausible;
+
+  return page.locator('body').evaluate((body, selectors) => {
+    const dateSource = '\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+20\\d{2}\\b';
+    const dateRegex = new RegExp(dateSource, 'i');
+    const dateRegexGlobal = new RegExp(dateSource, 'gi');
+    const markerRegex = /\b(?:Helpful|Report|Purchased:|Review before translation|Excellent|Good)\b/i;
+    const candidates = [];
+    for (const element of body.querySelectorAll('article, li, div')) {
+      const rawText = (element.innerText || '').replace(/\r/g, '').trim();
+      if (rawText.length < 25 || rawText.length > 20_000 || !dateRegex.test(rawText) || !markerRegex.test(rawText)) continue;
+      const dates = rawText.match(dateRegexGlobal) || [];
+      if (dates.length !== 1) continue;
+      candidates.push({ element, rawText });
+    }
+    candidates.sort((a, b) => a.rawText.length - b.rawText.length);
+    const selected = [];
+    for (const candidate of candidates) {
+      if (selected.some(item => candidate.element.contains(item.element))) continue;
+      selected.push(candidate);
+    }
+    return selected.map(({ element, rawText }, index) => {
+      const dateNode = element.querySelector(selectors.reviewDate);
+      const textNode = element.querySelector(selectors.reviewText);
+      const ratingNode = element.querySelector(selectors.reviewRating);
+      const regionLabel = [...element.querySelectorAll('[aria-label]')]
+        .map(node => node.getAttribute('aria-label') || '').find(value => /\bin\s+.+\s+on\s+/i.test(value)) || '';
+      const attributeRating = [...element.querySelectorAll('[aria-label],[data-rating]')]
+        .map(node => node.getAttribute('aria-label') || node.getAttribute('data-rating') || '')
+        .find(value => /(?:[1-5](?:[.,]\d)?\s*(?:out of 5|stars?|rating)|^(?:Excellent|Good|Average|Poor|Bad)$)/i.test(value));
+      const labelAfterDate = rawText.match(new RegExp(`${dateSource}\\s+(Excellent|Good|Average|Poor|Bad)\\b`, 'i'))?.[1] || '';
+      return {
+        domId: element.getAttribute('data-review-id') || element.id || '',
+        dateText: dateNode?.getAttribute('datetime') || dateNode?.textContent || regionLabel || rawText.match(dateRegex)?.[0] || '',
+        reviewText: textNode?.textContent || rawText,
+        ratingText: ratingNode?.getAttribute('aria-label') || ratingNode?.textContent || attributeRating || labelAfterDate,
+        variant: rawText.match(/Purchased:\s*([^\n]+)/i)?.[1]?.trim() || '',
+        reviewerRegion: regionLabel.match(/\bin\s+(.+?)\s+on\s+/i)?.[1]?.trim() || '',
+        isTranslated: /Review before translation:/i.test(rawText),
+        imageUrls: [...element.querySelectorAll('img[src]')].map(node => node.src)
+          .filter(src => !/avatar|openingemail|upload_aimg\/commodity/i.test(src)).slice(0, 20),
+        rawText,
+        index
+      };
+    });
+  }, {
+    reviewDate: config.selectors.reviewDate,
+    reviewText: config.selectors.reviewText,
+    reviewRating: config.selectors.reviewRating
+  });
+}
+
+async function revealReviews(page, config) {
+  const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews)/i);
+  const headingCount = await headings.count().catch(() => 0);
+  if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
+  const openers = [
+    page.locator(config.selectors.reviewOpen),
+    page.getByText(/^(?:See all|View all|All)\s+reviews/i),
+    page.locator("[role='button']:has-text('reviews')")
+  ];
+  for (const opener of openers) {
+    if (await clickIfVisible(opener)) break;
+  }
+  await page.waitForTimeout(1_000);
+
+  let sorted = /Sort by:\s*Most recent/i.test(await page.locator('body').innerText().catch(() => ''));
+  if (!sorted) sorted = await clickIfVisible(page.locator(config.selectors.reviewSort));
+  if (!sorted) {
+    const sortTriggers = [
+      page.locator("button:has-text('Recommended')"),
+      page.locator("[role='button']:has-text('Recommended')"),
+      page.locator("button:has-text('Sort by')"),
+      page.locator("[role='button']:has-text('Sort by')")
+    ];
+    for (const trigger of sortTriggers) {
+      if (await clickIfVisible(trigger)) break;
+    }
+    await page.waitForTimeout(400);
+    await clickIfVisible(page.getByText(/^Most recent$/i));
+  }
+  await page.waitForTimeout(1_200);
+  await page.evaluate(() => {
+    for (const element of document.querySelectorAll('*')) {
+      const style = getComputedStyle(element);
+      const text = (element.innerText || '').slice(0, 2_000);
+      if (element.scrollHeight > element.clientHeight + 100
+        && /^(?:auto|scroll)$/.test(style.overflowY)
+        && /All reviews are from verified purchases|Most recent|Helpful/i.test(text)) {
+        element.scrollTop = 0;
+      }
+    }
+  }).catch(() => {});
+}
+
+async function scrollReviewPanel(page) {
+  return page.evaluate(() => {
+    const candidates = [...document.querySelectorAll('*')].filter(element => {
+      const style = getComputedStyle(element);
+      const text = (element.innerText || '').slice(0, 3_000);
+      return element.scrollHeight > element.clientHeight + 100
+        && /^(?:auto|scroll)$/.test(style.overflowY)
+        && /All reviews are from verified purchases|Most recent|Helpful/i.test(text);
+    });
+    const target = candidates.sort((a, b) => a.clientHeight - b.clientHeight)[0];
+    if (!target) return false;
+    const before = target.scrollTop;
+    target.scrollTop = Math.min(target.scrollHeight, before + Math.max(400, Math.floor(target.clientHeight * 0.85)));
+    target.dispatchEvent(new Event('scroll', { bubbles: true }));
+    return target.scrollTop > before;
+  }).catch(() => false);
+}
+
+async function detectProductPageProblem(page, expectedProductUrl = '') {
+  const visibleText = async pattern => {
+    const matches = page.getByText(pattern);
+    const count = Math.min(await matches.count().catch(() => 0), 20);
+    for (let index = 0; index < count; index += 1) {
+      if (await matches.nth(index).isVisible().catch(() => false)) return true;
+    }
+    return false;
+  };
+  if (await visibleText(/This item is sold out|currently unavailable|item is unavailable|item has been discontinued|unavailable for purchase|item details are unavailable|not available for purchase|out of stock|此商品已售罄|商品已售罄|无法购买|商品详情(?:无法使用|不可用)|商品不存在|暂无库存/i)) {
+    return classifyTemuProductPage('This item is sold out');
+  }
+  if (await visibleText(/Oops!?\s*The items? (?:are|is) gone|Try again to find items|商品已下架|商品链接已失效/i)) {
+    return classifyTemuProductPage('Oops! The items are gone');
+  }
+  if (await visibleText(/Please check your network connection and try again|network error|connection error|网络连接错误|请检查网络/i)) {
+    return classifyTemuProductPage('Please check your network connection and try again');
+  }
+  if (await visibleText(/access denied|unusual traffic|temporarily restricted|too many requests|service unavailable in your region/i)) {
+    return { code: 'restricted', permanent: false, message: 'Temu当前会话或访问频率受到限制，请稍后重试。' };
+  }
+  try {
+    const expected = new URL(expectedProductUrl);
+    const current = new URL(page.url());
+    if (/\/g-\d+\.html$/i.test(expected.pathname) && /\/category\.html$/i.test(current.pathname)) {
+      return { code: 'item_redirected', permanent: true, message: '商品链接已跳转到类目空页面，已跳过评论抓取。' };
+    }
+  } catch {}
+  return null;
+}
+
+async function resolveTransientProductProblem(page, config, label, expectedProductUrl) {
+  let problem = await detectProductPageProblem(page, expectedProductUrl);
+  if (!problem || problem.permanent || config.browser.headless) return problem;
+  const retryLimit = Math.max(1, Number(config.browser.manualRetryLimit ?? 8));
+  for (let attempt = 1; attempt <= retryLimit && problem && !problem.permanent; attempt += 1) {
+    await promptEnter(`${label}${problem.message}\n请先确认当前Chrome已经能正常显示商品列表，再点击运营台“继续执行”（第 ${attempt}/${retryLimit} 次）：`);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+    await handleChallenge(page, config, label);
+    problem = await detectProductPageProblem(page, expectedProductUrl);
+    if (problem && !problem.permanent && attempt < retryLimit) {
+      console.log('重新加载后Temu仍提示网络异常，任务没有退出，将继续等待人工处理。');
+    }
+  }
+  return problem;
+}
+
+function isBrowserClosedError(error) {
+  return /Target page, context or browser has been closed|browserContext\.newPage/i.test(error?.message ?? String(error));
+}
+
+function classifyReviewFailure(error) {
+  const message = error?.message ?? String(error);
+  if (isBrowserClosedError(error)) return 'browser_closed';
+  if (/captcha|verify|verification|验证码|安全验证|登录/i.test(message)) return 'captcha_or_login';
+  if (/network|connection|VPN|ERR_/i.test(message)) return 'network_error';
+  if (/restricted|too many requests|access denied|unusual traffic/i.test(message)) return 'restricted';
+  if (/售罄|不可销售|失效|redirected|gone/i.test(message)) return 'invalid_link';
+  if (/选择器|未提取到评论|selector/i.test(message)) return 'selector_error';
+  return 'unknown_error';
+}
+
+async function gatherReviews(page, config, productUrl, options = {}) {
+  await revealReviews(page, config);
+  const cutoff = daysAgoIso(29);
+  const reviews = new Map();
+  let staleRounds = 0;
+  let oldestSeen = null;
+  const sourceProductId = String(productUrl).match(/-g-(\d+)\.html/i)?.[1] ?? '';
+  for (let round = 0; round < config.browser.maxReviewPages && staleRounds < 3; round += 1) {
+    const cards = await extractReviewCards(page, config);
+    const before = reviews.size;
+    const newReviews = [];
+    for (const card of cards) {
+      const reviewDate = parseReviewDate(card.dateText || card.rawText);
+      if (reviewDate && (!oldestSeen || reviewDate < oldestSeen)) oldestSeen = reviewDate;
+      const reviewText = cleanTemuReviewText(card.reviewText || card.rawText);
+      const stableText = `${card.domId}|${reviewDate}|${card.ratingText}|${reviewText}|${card.variant ?? ''}`;
+      const externalReviewId = card.domId || crypto.createHash('sha256').update(stableText).digest('hex').slice(0, 24);
+      if (reviews.has(externalReviewId)) continue;
+      const review = {
+        externalReviewId,
+        reviewDate,
+        rating: parseRating(card.ratingText),
+        reviewText,
+        variant: card.variant ?? '',
+        reviewerRegion: card.reviewerRegion ?? '',
+        isTranslated: Boolean(card.isTranslated),
+        imageUrls: card.imageUrls ?? [],
+        sourceProductId,
+        sourceUrl: productUrl,
+        raw: { dateText: card.dateText, ratingText: card.ratingText, rawText: card.rawText }
+      };
+      reviews.set(externalReviewId, review);
+      newReviews.push(review);
+    }
+    if (newReviews.length > 0 && options.onBatch) await options.onBatch(newReviews);
+    staleRounds = reviews.size === before ? staleRounds + 1 : 0;
+    if (options.onCheckpoint) {
+      await options.onCheckpoint({
+        pageIndex: round + 1,
+        oldestReviewDate: oldestSeen,
+        reviewCount: reviews.size,
+        fullHistory: Boolean(options.fullHistory)
+      });
+    }
+    if (!options.fullHistory && oldestSeen && oldestSeen < cutoff) break;
+    const clicked = await clickIfVisible(page.locator(config.selectors.reviewLoadMore));
+    const scrolled = clicked ? true : await scrollReviewPanel(page);
+    if (!scrolled) await page.mouse.wheel(0, 2200);
+    await humanDelay(config);
+  }
+  return [...reviews.values()];
+}
+
+async function saveSnapshot(page, config, name) {
+  if (!config.browser.saveSnapshots) return;
+  const dir = path.join(config.outputDir, 'debug');
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, `${name}.html`), await page.content(), 'utf8');
+  await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false }).catch(() => {});
+}
+
+function computeAnalysis(db, productId, enriched, config) {
+  const allReviews = getReviewsForProduct(db, productId);
+  const eligible = allReviews.filter(review => review.reviewDate && !Number(review.isDuplicate));
+  const cutoff7 = daysAgoIso(6);
+  const cutoff30 = daysAgoIso(29);
+  const cutoff90 = daysAgoIso(89);
+  const recent7 = eligible.filter(review => review.reviewDate >= cutoff7);
+  const recent30 = eligible.filter(review => review.reviewDate >= cutoff30);
+  const recent90 = eligible.filter(review => review.reviewDate >= cutoff90);
+  const reviewsUnavailable = allReviews.length === 0 && Number(enriched.totalReviewCount) > 0;
+  const recent30dReviews = reviewsUnavailable ? null : recent30.length;
+  const recent30dDailyAvg = recent30dReviews == null ? null : Number((recent30dReviews / 30).toFixed(2));
+  const negativeMaxRating = Number(config.reviewAnalysis?.negativeMaxRating ?? 3);
+  const negativeRecent = summarizeNegativeReviews(recent30, negativeMaxRating);
+  const negativeAll = summarizeNegativeReviews(eligible, negativeMaxRating);
+  const oldestKnown = eligible.map(review => review.reviewDate).sort()[0] ?? null;
+  const listingDateRangeStart = oldestKnown ? daysBeforeIso(oldestKnown, 30) : null;
+  const prior23Count = Math.max(0, recent30.length - recent7.length);
+  const recent7Daily = recent7.length / 7;
+  const prior23Daily = prior23Count / 23;
+  const growthRatio = prior23Daily > 0 ? recent7Daily / prior23Daily : recent7.length > 0 ? Infinity : 0;
+  const fastGrowing = recent30.length >= 5 && growthRatio >= Number(config.reviewAnalysis?.fastGrowthRatio ?? 1.5);
+  const reviewGrowthSignal = recent30.length < 5 ? '数据不足'
+    : fastGrowing ? '近期加速'
+      : growthRatio <= 0.67 ? '近期放缓' : '相对平稳';
+  const selection = evaluateSelection({ ...enriched, recent30dDailyAvg }, config);
+  return {
+    recent7dReviews: reviewsUnavailable ? null : recent7.length,
+    recent30dReviews,
+    recent90dReviews: reviewsUnavailable ? null : recent90.length,
+    recent30dDailyAvg,
+    reviewGrowthSignal,
+    fastGrowing,
+    negativeSummary: negativeRecent.summary,
+    negativeCategoriesRecent: negativeRecent.categories,
+    negativeCategoriesAll: negativeAll.categories,
+    listingDateEstimate: oldestKnown,
+    listingDateRangeStart,
+    listingDateRangeEnd: oldestKnown,
+    listingDateBasis: oldestKnown ? '最早可见评论前30天至该评论日（估算，非平台官方上架时间）' : '',
+    ...selection
+  };
+}
+
+function daysBeforeIso(isoDate, days) {
+  const date = new Date(`${isoDate}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setUTCDate(date.getUTCDate() - Number(days));
+  return date.toISOString().slice(0, 10);
+}
+
+export async function refreshCatalog(config, db) {
+  for (const [jobIndex, job] of config.jobs.entries()) {
+    if (job.url.startsWith('PASTE_')) throw new Error(`jobs[${jobIndex}].url 仍是占位符，请填入Temu分类页URL。`);
+  }
+  const runId = startRun(db, { ...config, mode: 'catalog-refresh' });
+  let session;
+  const summary = { runId, active: 0, added: 0, retained: 0, archived: 0 };
+  try {
+    session = await openContext(config);
+    const page = session.context.pages().find(candidate => !candidate.isClosed()) ?? await session.context.newPage();
+    for (const [jobIndex, job] of config.jobs.entries()) {
+      await openJobListing(page, config, job);
+      if (!config.browser.headless && config.browser.pauseBeforeStart) {
+        await promptEnter(`商品池刷新已暂停。请确认当前Chrome显示 ${config.siteCountry} / ${config.language} / ${config.currency} 的“${job.subcategory}”商品列表；完成登录或验证后回到本窗口按 Enter，程序将自动确认 ${job.sortOrder} 排序：`);
+      }
+      await handleChallenge(page, config, '商品池刷新');
+      if (await isGoneListingPage(page) || !await hasProductLinks(page, config)) {
+        await discoverCurrentListing(page, config, job);
+      }
+      await saveSnapshot(page, config, `catalog-before-sort-${runId}-${jobIndex + 1}`);
+      try {
+        await ensureTopSalesSort(page, job);
+      } catch (error) {
+        await saveSnapshot(page, config, `catalog-sort-failed-${runId}-${jobIndex + 1}`).catch(() => {});
+        throw error;
+      }
+      await page.locator(config.selectors.productLinks).first().waitFor({ state: 'attached', timeout: 30_000 }).catch(() => {});
+      const products = await gatherProducts(page, config, job);
+      await cacheProductImages(page, config, products).catch(error => console.warn(`商品主图缓存未完成：${error.message}`));
+      await saveSnapshot(page, config, `catalog-refresh-${runId}-${jobIndex + 1}`);
+      if (products.length === 0) {
+        throw new Error('当前类目页未发现商品，旧商品池未作任何修改。请检查网络、登录状态和类目页。');
+      }
+      const result = replaceActiveCatalog(db, {
+        siteCountry: config.siteCountry,
+        primaryCategory: job.primaryCategory,
+        subcategory: job.subcategory
+      }, products, runId);
+      summary.active += result.active;
+      summary.added += result.added;
+      summary.retained += result.retained;
+      summary.archived += result.archived;
+      console.log(`商品池已刷新：当前=${result.active}，新增=${result.added}，继续在售=${result.retained}，退出当前池=${result.archived}。`);
+    }
+    finishRun(db, runId, 'completed');
+    return summary;
+  } catch (error) {
+    finishRun(db, runId, 'failed', error.stack ?? error.message);
+    throw error;
+  } finally {
+    await closeSession(session);
+  }
+}
+
+export async function captureCurrentCatalog(config, db) {
+  if (config.jobs.length !== 1) {
+    throw new Error('当前页采集模式一次只支持一个类目，请在 config.json 中只保留一个 jobs 项。');
+  }
+  const job = config.jobs[0];
+  const runId = startRun(db, { ...config, mode: 'catalog-capture' });
+  let session;
+  const summary = { runId, active: 0, added: 0, retained: 0, archived: 0 };
+  try {
+    session = await openExistingOperatorContext(config);
+    const page = await findCurrentOperatorTemuPage(session.context);
+    if (!page) {
+      throw new Error('采集 Chrome 中没有 Temu 页面。请人工打开 Temu 摩托配件商品列表并选择 Top Sales。');
+    }
+    console.log('半自动采集已连接运营人员当前使用的普通 Chrome；程序不会跳转、搜索或自动刷新页面。');
+    await validateCurrentCatalogPage(page, config, job);
+    await saveSnapshot(page, config, `catalog-capture-before-${runId}`);
+    const products = (await gatherProducts(page, config, job)).map(product => ({
+      ...product,
+      raw: { ...product.raw, capturedFrom: page.url(), captureMode: 'current-page' }
+    }));
+    const scope = [config.siteCountry, job.primaryCategory, job.subcategory];
+    const existingActiveCount = Number(db.prepare(`SELECT COUNT(*) AS count FROM products
+      WHERE catalog_active=1 AND site_country=? AND primary_category=? AND subcategory=?`).get(...scope).count);
+    if (products.length < existingActiveCount) {
+      throw new Error(`本次只累计到 ${products.length} 个商品，少于现有商品池 ${existingActiveCount} 个；为防止虚拟列表漏抓，原商品池未作任何修改。请保持当前 Top Sales 页面正常后重试。`);
+    }
+    await cacheProductImages(page, config, products).catch(error => console.warn(`商品主图缓存未完成：${error.message}`));
+    await saveSnapshot(page, config, `catalog-capture-${runId}`);
+    const minimum = Math.min(Number(job.targetCount ?? config.targetCount), config.browser.minimumCatalogCount);
+    if (products.length < minimum) {
+      throw new Error(`当前页只采集到 ${products.length} 个商品，低于安全阈值 ${minimum}；原商品池未作任何修改。请先正常滚动加载更多商品后重试。`);
+    }
+    const result = replaceActiveCatalog(db, {
+      siteCountry: scope[0],
+      primaryCategory: scope[1],
+      subcategory: scope[2]
+    }, products, runId);
+    Object.assign(summary, result);
+    finishRun(db, runId, 'completed');
+    console.log(`当前页采集完成：当前=${result.active}，新增=${result.added}，继续在售=${result.retained}，退出当前池=${result.archived}。`);
+    return summary;
+  } catch (error) {
+    finishRun(db, runId, 'failed', error.stack ?? error.message);
+    throw error;
+  } finally {
+    await closeSession(session);
+  }
+}
+
+export async function captureCurrentProductReviews(config, db) {
+  const runId = startRun(db, { ...config, mode: 'current-product-reviews' });
+  let session;
+  let product = null;
+  let started = false;
+  try {
+    session = await openExistingOperatorContext(config);
+    const page = await findCurrentOperatorTemuPage(session.context);
+    if (!page) throw new Error('采集 Chrome 中没有 Temu 页面。请先从 Top Sales 列表手动打开一个商品详情页。');
+
+    const currentUrl = canonicalProductUrl(page.url());
+    if (!/-g-\d+\.html/i.test(currentUrl) && !/[?&]goods_id=\d+/i.test(currentUrl)) {
+      throw new Error('当前 Chrome 不是商品详情页。请从 Top Sales 列表手动点开一个商品，确认详情与评价正常显示后再采集。');
+    }
+    product = getActiveProductByUrl(db, currentUrl);
+    if (!product) {
+      throw new Error('当前商品不在已采集的 Top Sales 商品池中。请返回商品池中的商品并从列表重新点开。');
+    }
+
+    console.log(`已连接运营当前商品：Top Sales #${product.listingRank ?? '-'} ${product.title.slice(0, 70)}`);
+    console.log('当前页评论采集不会跳转、搜索或刷新商品链接；只操作运营已经打开的这个商品页。');
+    markReviewCrawlStarted(db, product.id, runId);
+    started = true;
+    await handleChallenge(page, config, '当前商品评论');
+    const problem = await detectProductPageProblem(page, product.productUrl);
+    if (problem?.permanent) {
+      const resultCode = problem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+      markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
+        new Error(`SKIPPED: ${problem.message}`), resultCode);
+      finishRun(db, runId, 'completed');
+      console.log(`当前商品未采集评论：${problem.message}`);
+      return { runId, productId: product.id, listingRank: product.listingRank, title: product.title,
+        resultCode, reviewCount: product.storedReviewCount, newReviews: 0 };
+    }
+    if (problem) throw new Error(problem.message);
+
+    const enriched = await extractStructuredProduct(page, product);
+    const productId = upsertProduct(db, enriched, runId);
+    const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
+      && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
+    const reviews = await gatherReviews(page, config, product.productUrl, {
+      fullHistory,
+      onBatch: batch => upsertReviews(db, productId, batch),
+      onCheckpoint: checkpoint => updateReviewCrawlCheckpoint(db, productId, checkpoint)
+    });
+    upsertReviews(db, productId, reviews);
+    const storedReviewCount = getReviewsForProduct(db, productId).length;
+    if (storedReviewCount === 0 && Number(enriched.totalReviewCount) > 0) {
+      throw new Error(`页面显示有 ${enriched.totalReviewCount} 条评价，但当前选择器未提取到评论。请保持评论区域打开后重试当前页。`);
+    }
+    updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
+    const resultCode = storedReviewCount > 0 ? 'completed' : 'no_reviews';
+    markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null, resultCode);
+    await saveSnapshot(page, config, `current-reviews-${runId}`);
+    finishRun(db, runId, 'completed');
+    console.log(`当前商品评论采集完成：Top Sales #${product.listingRank ?? '-'}，本次扫描=${reviews.length}，库内去重后=${storedReviewCount}。`);
+    return { runId, productId, listingRank: product.listingRank, title: enriched.title,
+      resultCode, reviewCount: storedReviewCount, newReviews: reviews.length };
+  } catch (error) {
+    if (product && started) {
+      const storedReviewCount = getReviewsForProduct(db, product.id).length;
+      markReviewCrawlFinished(db, product.id, 'failed', storedReviewCount, error, classifyReviewFailure(error));
+    }
+    recordError(db, runId, product?.productUrl ?? '', 'current-product-reviews', error);
+    finishRun(db, runId, 'failed', error.stack ?? error.message);
+    throw error;
+  } finally {
+    await closeSession(session);
+  }
+}
+
+export async function crawl(config, db) {
+  for (const [jobIndex, job] of config.jobs.entries()) {
+    if (job.url.startsWith('PASTE_')) throw new Error(`jobs[${jobIndex}].url 仍是占位符，请填入Temu分类页URL。`);
+  }
+  const runId = startRun(db, config);
+  let session;
+  let completed = 0;
+  try {
+    session = await openContext(config);
+    const page = session.context.pages()[0] ?? await session.context.newPage();
+    for (const [jobIndex, job] of config.jobs.entries()) {
+      const expectedPathname = new URL(job.url).pathname;
+      await navigateTemu(page, job.url);
+      await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+      await handleChallenge(page, config, '分类页');
+      if (new URL(page.url()).pathname !== expectedPathname) {
+        console.log('登录/验证后未停留在目标类目，正在重新打开类目页。');
+        await navigateTemu(page, job.url);
+        await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+        await handleChallenge(page, config, '分类页');
+      }
+      if (!config.browser.headless && config.browser.pauseBeforeStart) {
+        await promptEnter(`请确认当前页面已设置为 ${config.siteCountry} / ${config.language} / ${config.currency} / ${job.sortOrder}，确认后按 Enter：`);
+      }
+      await sleep(500);
+      await handleChallenge(page, config, '分类页');
+      if (new URL(page.url()).pathname !== expectedPathname) {
+        console.log('人工确认后页面已离开目标类目，正在恢复类目页。');
+        await navigateTemu(page, job.url);
+        await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+        await handleChallenge(page, config, '分类页');
+      }
+      await ensureTopSalesSort(page, job);
+      const products = await gatherProducts(page, config, job);
+      await saveSnapshot(page, config, `category-${jobIndex + 1}`);
+      if (products.length === 0) {
+        throw new Error('分类页未发现商品。请检查是否仍停留在登录/验证页面，或页面选择器是否已失效。');
+      }
+      for (const [index, product] of products.entries()) {
+        const detailPage = await session.context.newPage();
+        try {
+          await navigateTemu(detailPage, product.productUrl);
+          await handleChallenge(detailPage, config, `商品 ${index + 1}`);
+          await sleep(config.browser.minimumDelayMs);
+          const enriched = await extractStructuredProduct(detailPage, product);
+          const productId = upsertProduct(db, enriched, runId);
+          const reviews = await gatherReviews(detailPage, config, product.productUrl);
+          upsertReviews(db, productId, reviews);
+          updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
+          completed += 1;
+          process.stdout.write(`完成商品 ${completed}：${enriched.title.slice(0, 45)}\r`);
+          if (index < 3) await saveSnapshot(detailPage, config, `product-${jobIndex + 1}-${index + 1}`);
+        } catch (error) {
+          recordError(db, runId, product.productUrl, 'product-detail', error);
+          console.error(`\n商品失败，已记录并继续：${product.productUrl} - ${error.message}`);
+        } finally {
+          await detailPage.close();
+          await sleep(config.browser.minimumDelayMs);
+        }
+      }
+    }
+    process.stdout.write('\n');
+    finishRun(db, runId, 'completed');
+    return { runId, completed };
+  } catch (error) {
+    finishRun(db, runId, 'failed', error.stack ?? error.message);
+    throw error;
+  } finally {
+    await closeSession(session);
+  }
+}
+
+export async function crawlReviews(config, db, options = {}) {
+  const batchSize = Math.max(1, Number(options.batchSize ?? 10));
+  const candidates = listReviewCrawlCandidates(db, {
+    limit: batchSize,
+    retryFailed: Boolean(options.retryFailed),
+    includeReviewed: Boolean(options.includeReviewed)
+  });
+  const runConfig = { ...config, mode: 'reviews-only', reviewBatch: { ...options, batchSize } };
+  const runId = startRun(db, runConfig);
+  let session;
+  let completed = 0;
+  let reviewDataSuccess = 0;
+  let skipped = 0;
+  let failed = 0;
+  let reviewsSeen = 0;
+  try {
+    if (candidates.length === 0) {
+      finishRun(db, runId, 'completed');
+      return { runId, completed, skipped, failed, reviewsSeen, summary: getReviewCrawlSummary(db) };
+    }
+    session = await openContext(config);
+    const detailPage = session.context.pages().find(page => !page.isClosed()) ?? await session.context.newPage();
+    let operatorConfirmed = false;
+    console.log(`本批仅抓评论：商品=${candidates.length}，失败重试=${options.retryFailed ? '是' : '否'}。`);
+    for (const [index, product] of candidates.entries()) {
+      markReviewCrawlStarted(db, product.id, runId);
+      try {
+        if (detailPage.isClosed()) throw new Error('Target page, context or browser has been closed');
+        await navigateTemu(detailPage, product.productUrl);
+        await handleChallenge(detailPage, config, `评论商品 ${index + 1}/${candidates.length}`);
+        await sleep(config.browser.minimumDelayMs);
+        let pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
+        if (pageProblem?.permanent) {
+          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
+            new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
+          skipped += 1;
+          console.log(`评论跳过 ${completed + skipped + failed}/${candidates.length}：${pageProblem.message} ${product.title.slice(0, 42)}`);
+          continue;
+        }
+        if (pageProblem) throw new Error(pageProblem.message);
+        if (!operatorConfirmed && !config.browser.headless && config.browser.pauseBeforeStart) {
+          await promptEnter('评论抓取已暂停。请在当前Chrome中完成登录、验证码或安全验证，并确认商品详情和评价区域正常显示；完成后回到本窗口按 Enter 开始：');
+          operatorConfirmed = true;
+          await handleChallenge(detailPage, config, '评论抓取开始前');
+        }
+        pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
+        if (pageProblem?.permanent) {
+          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
+            new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
+          skipped += 1;
+          console.log(`评论跳过 ${completed + skipped + failed}/${candidates.length}：${pageProblem.message} ${product.title.slice(0, 42)}`);
+          continue;
+        }
+        if (pageProblem) throw new Error(pageProblem.message);
+        const configuredSortOrder = config.jobs.find(job => job.subcategory === product.subcategory)?.sortOrder ?? product.sortOrder;
+        const enriched = await extractStructuredProduct(detailPage, { ...product, sortOrder: configuredSortOrder });
+        const productId = upsertProduct(db, enriched, runId);
+        const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
+          && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
+        const reviews = await gatherReviews(detailPage, config, product.productUrl, {
+          fullHistory,
+          onBatch: batch => upsertReviews(db, productId, batch),
+          onCheckpoint: checkpoint => updateReviewCrawlCheckpoint(db, productId, checkpoint)
+        });
+        upsertReviews(db, productId, reviews);
+        const storedReviewCount = getReviewsForProduct(db, productId).length;
+        if (storedReviewCount === 0 && Number(enriched.totalReviewCount) > 0) {
+          throw new Error(`页面显示有 ${enriched.totalReviewCount} 条评价，但当前选择器未提取到评论。`);
+        }
+        updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
+        markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null,
+          storedReviewCount === 0 ? 'no_reviews' : 'completed');
+        completed += 1;
+        if (storedReviewCount > 0) reviewDataSuccess += 1;
+        reviewsSeen += reviews.length;
+        console.log(`评论完成 ${completed + skipped + failed}/${candidates.length}：新增扫描=${reviews.length}，库内=${storedReviewCount}，${enriched.title.slice(0, 42)}`);
+        if (index < 2) await saveSnapshot(detailPage, config, `reviews-only-${runId}-${index + 1}`);
+      } catch (error) {
+        failed += 1;
+        const storedReviewCount = getReviewsForProduct(db, product.id).length;
+        markReviewCrawlFinished(db, product.id, 'failed', storedReviewCount, error, classifyReviewFailure(error));
+        recordError(db, runId, product.productUrl, 'reviews-only', error);
+        console.error(`评论失败 ${completed + skipped + failed}/${candidates.length}：${product.productUrl} - ${error.message}`);
+        await saveSnapshot(detailPage, config, `reviews-failed-${runId}-${index + 1}`).catch(() => {});
+        if (isBrowserClosedError(error)) {
+          console.error('检测到采集浏览器已被关闭，本批已安全停止；未开始的商品会保留到下次。');
+          break;
+        }
+      } finally {
+        await sleep(config.browser.minimumDelayMs);
+      }
+    }
+    const attempted = completed + skipped + failed;
+    const requiredSuccess = Number(config.reviewAnalysis?.minimumPilotSuccess ?? 8);
+    const pilotAcceptance = attempted === Number(config.reviewAnalysis?.pilotBatchSize ?? 10)
+      ? {
+          attempted,
+          processed: completed + skipped,
+          successful: reviewDataSuccess,
+          requiredSuccess,
+          passed: reviewDataSuccess >= requiredSuccess
+        }
+      : null;
+    finishRun(db, runId, failed > 0 ? 'completed_with_errors' : 'completed');
+    return { runId, completed, reviewDataSuccess, skipped, failed, reviewsSeen, pilotAcceptance, summary: getReviewCrawlSummary(db) };
+  } catch (error) {
+    finishRun(db, runId, 'failed', error.stack ?? error.message);
+    throw error;
+  } finally {
+    await closeSession(session);
+  }
+}
