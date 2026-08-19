@@ -356,6 +356,8 @@ export function listReviewCrawlCandidates(db, options = {}) {
   const limit = Math.max(1, Number(options.limit ?? 10));
   const retryFailed = options.retryFailed ? 1 : 0;
   const includeReviewed = options.includeReviewed ? 1 : 0;
+  const selectedOnly = options.selectedOnly ? 1 : 0;
+  const includeQuickCompleted = options.includeQuickCompleted ? 1 : 0;
   return db.prepare(`
     SELECT
       p.id,p.product_url AS productUrl,p.site_country AS siteCountry,p.currency,
@@ -373,8 +375,10 @@ export function listReviewCrawlCandidates(db, options = {}) {
       AND p.product_url NOT LIKE '%goods_id=demo%'
       AND p.subcategory <> 'Demo'
       AND p.catalog_active=1
+      AND (?=0 OR p.selected=1)
       AND (
         s.status IS NULL OR s.status IN ('pending','in_progress') OR (?=1 AND s.status='failed')
+        OR (?=1 AND s.status='completed' AND COALESCE(s.result_code,'completed') IN ('completed','no_reviews'))
       )
       AND (
         ?=1 OR s.product_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM reviews existing WHERE existing.product_id=p.id)
@@ -383,7 +387,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       CASE COALESCE(s.status,'pending') WHEN 'in_progress' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
       COALESCE(p.listing_rank,2147483647),COALESCE(p.sales_count,0) DESC,p.id
     LIMIT ?
-  `).all(retryFailed, includeReviewed, limit).map(row => {
+  `).all(selectedOnly, retryFailed, includeQuickCompleted, includeReviewed, limit).map(row => {
     let raw = {};
     try { raw = JSON.parse(row.rawJson || '{}'); } catch {}
     return { ...row, raw };

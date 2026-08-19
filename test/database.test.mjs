@@ -80,6 +80,32 @@ test('review batches skip products that already have imported reviews by default
   db.close();
 });
 
+test('deep review batches only return products marked as selected', () => {
+  const db = openDatabase(':memory:');
+  const runId = startRun(db, { test: true });
+  const base = {
+    siteCountry: '德国', currency: 'EUR', primaryCategory: 'Automotive',
+    subcategory: 'Motorcycles & Powersports Accessories', sortOrder: 'Top Sales',
+    imageUrl: '', priceEur: 10, salesCount: 100, rating: 4.7, totalReviewCount: 20, raw: {}
+  };
+  const selectedId = upsertProduct(db, { ...base, productUrl: 'https://www.temu.com/de-en/selected-g-31.html', title: 'Selected' }, runId);
+  upsertProduct(db, { ...base, productUrl: 'https://www.temu.com/de-en/unselected-g-32.html', title: 'Unselected' }, runId);
+  db.prepare('UPDATE products SET selected=1 WHERE id=?').run(selectedId);
+
+  assert.deepEqual(listReviewCrawlCandidates(db, { limit: 10, selectedOnly: true }).map(row => row.id), [selectedId]);
+  markReviewCrawlStarted(db, selectedId, runId);
+  markReviewCrawlFinished(db, selectedId, 'completed', 12, null, 'completed');
+  assert.deepEqual(listReviewCrawlCandidates(db, {
+    limit: 10, selectedOnly: true, includeReviewed: true, includeQuickCompleted: true
+  }).map(row => row.id), [selectedId]);
+  markReviewCrawlStarted(db, selectedId, runId);
+  markReviewCrawlFinished(db, selectedId, 'completed', 30, null, 'deep_completed');
+  assert.equal(listReviewCrawlCandidates(db, {
+    limit: 10, selectedOnly: true, includeReviewed: true, includeQuickCompleted: true
+  }).length, 0);
+  db.close();
+});
+
 test('catalog refresh archives stale products and queues current products by Top Sales rank', () => {
   const db = openDatabase(':memory:');
   const oldRunId = startRun(db, { test: true, phase: 'old' });

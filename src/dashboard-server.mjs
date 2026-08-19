@@ -30,17 +30,24 @@ const taskDefinitions = {
       { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
     ]
   },
-  reviews: {
-    label: '验收 Top Sales 前10商品评论',
+  'reviews-light': {
+    label: '批量轻采集近30天评论',
     steps: [
-      { label: '抓取 Top Sales 前10商品评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10'] },
+      { label: '顺序抓取下一批商品近30天评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--review-mode', 'quick'] },
+      { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
+    ]
+  },
+  'reviews-deep': {
+    label: '批量深采集候选商品评论',
+    steps: [
+      { label: '深抓已选候选商品评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--review-mode', 'deep', '--selected-only', '--include-reviewed'] },
       { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
     ]
   },
   retry: {
     label: '重试失败评论',
     steps: [
-      { label: '重试失败商品评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--retry-failed'] },
+      { label: '重试失败商品评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--review-mode', 'quick', '--retry-failed'] },
       { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
     ]
   },
@@ -61,6 +68,7 @@ const taskDefinitions = {
 let currentChild = null;
 let taskSequence = 0;
 let task = idleTask();
+let pauseRequested = false;
 
 function browserSettings() {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -112,6 +120,9 @@ function idleTask() {
     status: 'idle',
     step: '',
     waitingForInput: false,
+    currentProduct: null,
+    batchProgress: null,
+    options: {},
     startedAt: null,
     finishedAt: null,
     exitCode: null,
@@ -132,6 +143,12 @@ function appendLog(value, source = 'info') {
     const text = line.trimEnd();
     if (!text) continue;
     task.logs.push({ at: new Date().toISOString(), source, text });
+    const progress = text.match(/^批量进度\s+(\d+)\/(\d+)：\s*(.+)$/);
+    if (progress) {
+      task.batchProgress = { current: Number(progress[1]), total: Number(progress[2]) };
+      task.currentProduct = progress[3];
+      task.step = `正在处理 ${progress[1]}/${progress[2]}：${progress[3]}`;
+    }
   }
   if (task.logs.length > 400) task.logs.splice(0, task.logs.length - 400);
   if (/按\s*Enter|按回车|Press\s+Enter|点击运营台.*继续执行/i.test(cleaned)) task.waitingForInput = true;
@@ -155,7 +172,11 @@ function runStep(step) {
     child.on('exit', code => {
       currentChild = null;
       task.waitingForInput = false;
-      if (code === 0) {
+      if (pauseRequested) {
+        const error = new Error('任务已由运营人员暂停。');
+        error.code = 'TASK_PAUSED';
+        reject(error);
+      } else if (code === 0) {
         appendLog(`完成：${step.label}`, 'system');
         resolve();
       } else {
@@ -165,33 +186,63 @@ function runStep(step) {
   });
 }
 
-async function runPipeline(kind) {
-  const definition = taskDefinitions[kind];
+async function runPipeline(definition) {
   try {
-    for (const step of definition.steps) await runStep(step);
+    for (const step of definition.steps) {
+      if (pauseRequested) {
+        const error = new Error('任务已由运营人员暂停。');
+        error.code = 'TASK_PAUSED';
+        throw error;
+      }
+      await runStep(step);
+    }
     task.status = 'completed';
     task.exitCode = 0;
     task.step = '全部完成';
     appendLog(`${definition.label}已完成。`, 'success');
   } catch (error) {
-    task.status = 'failed';
-    task.exitCode = 1;
-    task.step = '执行失败';
-    appendLog(error.message, 'error');
+    if (error.code === 'TASK_PAUSED' || pauseRequested) {
+      task.status = 'paused';
+      task.exitCode = null;
+      task.step = '已暂停；点击“继续批次”将从数据库断点恢复';
+      appendLog('批次已暂停，已完成评论不会重复；当前商品会在下次优先恢复。', 'operator');
+    } else {
+      task.status = 'failed';
+      task.exitCode = 1;
+      task.step = '执行失败';
+      appendLog(error.message, 'error');
+    }
   } finally {
     task.waitingForInput = false;
     task.finishedAt = new Date().toISOString();
   }
 }
 
-function startTask(kind) {
-  const definition = taskDefinitions[kind];
+function taskDefinition(kind, options = {}) {
+  const base = taskDefinitions[kind];
+  if (!base) return null;
+  const batchSize = Number(options.batchSize ?? 10);
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100) throw new Error('每批商品数必须是1到100之间的整数。');
+  return {
+    ...base,
+    steps: base.steps.map(step => {
+      const args = [...step.args];
+      const index = args.indexOf('--batch-size');
+      if (index >= 0) args[index + 1] = String(batchSize);
+      return { ...step, args };
+    })
+  };
+}
+
+function startTask(kind, options = {}) {
+  const definition = taskDefinition(kind, options);
   if (!definition) throw new Error('未知任务。');
   if (task.status === 'running') throw new Error('已有任务正在运行，请等待完成。');
-  if (['current-review', 'reviews', 'retry'].includes(kind) && !databaseSummary().catalogReady) {
+  if (['current-review', 'reviews-light', 'reviews-deep', 'retry'].includes(kind) && !databaseSummary().catalogReady) {
     throw new Error('当前商品池尚未完成一次有效采集。请先准备摩托配件 Top Sales 页面并运行“采集当前页面”。');
   }
   taskSequence += 1;
+  pauseRequested = false;
   task = {
     id: taskSequence,
     kind,
@@ -199,14 +250,32 @@ function startTask(kind) {
     status: 'running',
     step: '准备开始',
     waitingForInput: false,
+    currentProduct: null,
+    batchProgress: null,
+    options: { batchSize: Number(options.batchSize ?? 10) },
     startedAt: new Date().toISOString(),
     finishedAt: null,
     exitCode: null,
     logs: []
   };
   appendLog(`${definition.label}开始运行。`, 'system');
-  void runPipeline(kind);
+  void runPipeline(definition);
   return task;
+}
+
+function pauseTask() {
+  if (task.status !== 'running') throw new Error('当前没有正在运行的批次。');
+  if (!['reviews-light', 'reviews-deep', 'retry'].includes(task.kind)) throw new Error('当前任务不支持批次暂停。');
+  pauseRequested = true;
+  task.waitingForInput = false;
+  task.step = '正在安全暂停…';
+  appendLog('运营人员请求暂停；正在停止当前批次，数据库断点会保留。', 'operator');
+  currentChild?.kill();
+}
+
+function resumeTask() {
+  if (task.status !== 'paused') throw new Error('当前没有已暂停的批次。');
+  return startTask(task.kind, task.options);
 }
 
 function continueTask() {
@@ -387,9 +456,14 @@ const server = http.createServer(async (request, response) => {
       if (action === 'continue') {
         continueTask();
         json(response, 200, { ok: true });
+      } else if (action === 'pause') {
+        pauseTask();
+        json(response, 202, { ok: true });
+      } else if (action === 'resume') {
+        json(response, 202, { ok: true, task: resumeTask() });
       } else {
         if (action === 'clear' && body.confirmed !== true) throw new Error('清除 Excel 前必须进行确认。');
-        json(response, 202, { ok: true, task: startTask(action) });
+        json(response, 202, { ok: true, task: startTask(action, body) });
       }
       return;
     }

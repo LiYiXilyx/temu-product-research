@@ -1287,12 +1287,15 @@ export async function crawl(config, db) {
 
 export async function crawlReviews(config, db, options = {}) {
   const batchSize = Math.max(1, Number(options.batchSize ?? 10));
+  const reviewMode = options.reviewMode === 'deep' ? 'deep' : 'quick';
   const candidates = listReviewCrawlCandidates(db, {
     limit: batchSize,
     retryFailed: Boolean(options.retryFailed),
-    includeReviewed: Boolean(options.includeReviewed)
+    includeReviewed: Boolean(options.includeReviewed),
+    selectedOnly: Boolean(options.selectedOnly),
+    includeQuickCompleted: reviewMode === 'deep'
   });
-  const runConfig = { ...config, mode: 'reviews-only', reviewBatch: { ...options, batchSize } };
+  const runConfig = { ...config, mode: `reviews-${reviewMode}`, reviewBatch: { ...options, batchSize, reviewMode } };
   const runId = startRun(db, runConfig);
   let session;
   let completed = 0;
@@ -1308,10 +1311,11 @@ export async function crawlReviews(config, db, options = {}) {
     session = await openContext(config);
     const detailPage = session.context.pages().find(page => !page.isClosed()) ?? await session.context.newPage();
     let operatorConfirmed = false;
-    console.log(`本批仅抓评论：商品=${candidates.length}，失败重试=${options.retryFailed ? '是' : '否'}。`);
+    console.log(`批量评论模式=${reviewMode === 'deep' ? '深度分析' : '近30天轻采集'}，商品=${candidates.length}，仅候选=${options.selectedOnly ? '是' : '否'}，失败重试=${options.retryFailed ? '是' : '否'}。`);
     for (const [index, product] of candidates.entries()) {
       markReviewCrawlStarted(db, product.id, runId);
       try {
+        console.log(`批量进度 ${index + 1}/${candidates.length}：Top Sales #${product.listingRank ?? '-'} ${product.title.slice(0, 70)}`);
         if (detailPage.isClosed()) throw new Error('Target page, context or browser has been closed');
         await navigateTemu(detailPage, product.productUrl);
         await handleChallenge(detailPage, config, `评论商品 ${index + 1}/${candidates.length}`);
@@ -1344,8 +1348,7 @@ export async function crawlReviews(config, db, options = {}) {
         const configuredSortOrder = config.jobs.find(job => job.subcategory === product.subcategory)?.sortOrder ?? product.sortOrder;
         const enriched = await extractStructuredProduct(detailPage, { ...product, sortOrder: configuredSortOrder });
         const productId = upsertProduct(db, enriched, runId);
-        const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
-          && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
+        const fullHistory = reviewMode === 'deep';
         const reviews = await gatherReviews(detailPage, config, product.productUrl, {
           fullHistory,
           onBatch: batch => upsertReviews(db, productId, batch),
@@ -1357,8 +1360,10 @@ export async function crawlReviews(config, db, options = {}) {
           throw new Error(`页面显示有 ${enriched.totalReviewCount} 条评价，但当前选择器未提取到评论。`);
         }
         updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
-        markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null,
-          storedReviewCount === 0 ? 'no_reviews' : 'completed');
+        const completedCode = reviewMode === 'deep'
+          ? (storedReviewCount === 0 ? 'deep_no_reviews' : 'deep_completed')
+          : (storedReviewCount === 0 ? 'no_reviews' : 'completed');
+        markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null, completedCode);
         completed += 1;
         if (storedReviewCount > 0) reviewDataSuccess += 1;
         reviewsSeen += reviews.length;
@@ -1376,7 +1381,7 @@ export async function crawlReviews(config, db, options = {}) {
           break;
         }
       } finally {
-        await sleep(config.browser.minimumDelayMs);
+        await humanDelay(config);
       }
     }
     const attempted = completed + skipped + failed;
