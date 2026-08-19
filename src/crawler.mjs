@@ -1169,7 +1169,7 @@ export async function captureCurrentProductReviews(config, db) {
     await handleChallenge(page, config, '当前商品评论');
     const problem = await detectProductPageProblem(page, product.productUrl);
     if (problem?.permanent) {
-      const resultCode = problem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+      const resultCode = problem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
       setProductAvailability(db, product.id, resultCode, problem.message);
       markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
         new Error(`SKIPPED: ${problem.message}`), resultCode);
@@ -1326,7 +1326,7 @@ export async function crawlReviews(config, db, options = {}) {
         await sleep(config.browser.minimumDelayMs);
         let pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
-          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          const resultCode = pageProblem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
           setProductAvailability(db, product.id, resultCode, pageProblem.message);
           markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
             new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
@@ -1342,7 +1342,7 @@ export async function crawlReviews(config, db, options = {}) {
         }
         pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
-          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          const resultCode = pageProblem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
           setProductAvailability(db, product.id, resultCode, pageProblem.message);
           markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
             new Error(`SKIPPED: ${pageProblem.message}`), resultCode);

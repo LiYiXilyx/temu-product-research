@@ -107,7 +107,7 @@ test('deep review batches only return products marked as selected', () => {
   db.close();
 });
 
-test('sold-out products leave the review queue until a fresh catalog finds them again', () => {
+test('session-unavailable products leave the review queue until a fresh catalog finds them again', () => {
   const db = openDatabase(':memory:');
   const runId = startRun(db, { test: true });
   const product = {
@@ -117,7 +117,7 @@ test('sold-out products leave the review queue until a fresh catalog finds them 
   };
   const productId = upsertProduct(db, product, runId);
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 1);
-  setProductAvailability(db, productId, 'sold_out', 'This item is sold out');
+  setProductAvailability(db, productId, 'session_unavailable', 'Collector session shows unavailable');
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 0);
   setProductAvailability(db, productId, 'available');
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 })[0].id, productId);

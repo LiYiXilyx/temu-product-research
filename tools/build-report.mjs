@@ -148,7 +148,8 @@ function setColumnWidths(sheet) {
 }
 
 function reviewCrawlLabel(row) {
-  if (row.resultCode === 'sold_out') return '已售罄';
+  if (row.resultCode === 'session_unavailable') return '当前会话不可售';
+  if (row.resultCode === 'sold_out') return '当前会话显示售罄（待复核）';
   if (row.resultCode === 'no_reviews') return '无评论';
   if (row.status === 'in_progress') return '抓取中';
   if (row.status === 'failed') return '失败';
@@ -160,7 +161,8 @@ function reviewCrawlLabel(row) {
 function resultCodeLabel(code) {
   return ({
     pending: '待抓取', running: '抓取中', completed: '成功', deep_completed: '深采集成功',
-    no_reviews: '无评论', deep_no_reviews: '深采集无评论', sold_out: '售罄',
+    no_reviews: '无评论', deep_no_reviews: '深采集无评论',
+    session_unavailable: '当前会话不可售', sold_out: '当前会话显示售罄（待复核）',
     captcha_or_login: '验证码/登录', network_error: '网络错误', restricted: '访问受限',
     invalid_link: '链接失效', selector_error: '页面结构异常', browser_closed: '浏览器关闭',
     unknown_error: '未知错误'

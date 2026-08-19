@@ -297,7 +297,7 @@ function databaseSummary() {
     const reviewRow = db.prepare(`SELECT COUNT(*) AS count FROM reviews r JOIN products p ON p.id=r.product_id
       WHERE p.catalog_active=1 AND p.product_url NOT LIKE '%goods_id=demo%' AND p.subcategory<>'Demo'`).get();
     const unavailableRow = db.prepare(`SELECT COUNT(*) AS count FROM products
-      WHERE catalog_active=1 AND availability_status IN ('sold_out','invalid_link')
+      WHERE catalog_active=1 AND availability_status IN ('session_unavailable','invalid_link')
         AND product_url NOT LIKE '%goods_id=demo%' AND subcategory<>'Demo'`).get();
     const progress = { pending: 0, inProgress: 0, completed: 0, failed: 0 };
     for (const row of db.prepare(`SELECT COALESCE(s.status,'untracked') AS status,COUNT(*) AS count FROM products p

@@ -156,10 +156,23 @@ export function openDatabase(databasePath) {
 
 function backfillAvailabilityFromReviewState(db) {
   db.exec(`
+    -- A collector-side "sold out" page can be caused by this browser session's
+    -- country, account or cookie context. Keep historical observations scoped
+    -- to the collection session rather than declaring a product globally sold out.
+    UPDATE review_crawl_state
+    SET result_code='session_unavailable'
+    WHERE result_code='sold_out';
+
+    UPDATE products
+    SET
+      availability_status='session_unavailable',
+      availability_message=COALESCE(availability_message,'当前采集会话显示不可售，待正常会话或刷新商品池复核')
+    WHERE availability_status='sold_out';
+
     UPDATE products
     SET
       availability_status=CASE
-        WHEN (SELECT result_code FROM review_crawl_state WHERE product_id=products.id)='sold_out' THEN 'sold_out'
+        WHEN (SELECT result_code FROM review_crawl_state WHERE product_id=products.id)='session_unavailable' THEN 'session_unavailable'
         ELSE 'invalid_link'
       END,
       availability_checked_at=(SELECT last_finished_at FROM review_crawl_state WHERE product_id=products.id),
@@ -167,7 +180,7 @@ function backfillAvailabilityFromReviewState(db) {
     WHERE COALESCE(availability_status,'unknown')='unknown'
       AND id IN (
         SELECT product_id FROM review_crawl_state
-        WHERE result_code IN ('sold_out','invalid_link')
+        WHERE result_code IN ('session_unavailable','invalid_link')
       )
   `);
 }
@@ -214,7 +227,7 @@ export function upsertProduct(db, product, runId) {
 }
 
 export function setProductAvailability(db, productId, status, message = null) {
-  const valid = new Set(['available', 'sold_out', 'invalid_link', 'restricted', 'unknown']);
+  const valid = new Set(['available', 'session_unavailable', 'invalid_link', 'restricted', 'unknown']);
   if (!valid.has(status)) throw new Error(`无效商品可用性状态：${status}`);
   db.prepare(`UPDATE products SET availability_status=?,availability_checked_at=?,availability_message=? WHERE id=?`)
     .run(status, new Date().toISOString(), message ? String(message) : null, productId);
@@ -410,7 +423,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       AND p.product_url NOT LIKE '%goods_id=demo%'
       AND p.subcategory <> 'Demo'
       AND p.catalog_active=1
-      AND COALESCE(p.availability_status,'unknown') NOT IN ('sold_out','invalid_link')
+      AND COALESCE(p.availability_status,'unknown') NOT IN ('session_unavailable','invalid_link')
       AND (?=0 OR p.selected=1)
       AND (
         s.status IS NULL OR s.status IN ('pending','in_progress') OR (?=1 AND s.status='failed')
