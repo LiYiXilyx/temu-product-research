@@ -465,25 +465,83 @@ async function ensureTopSalesSort(page, job) {
   }
 }
 
+async function assertCatalogViewportHealthy(page, config, stage) {
+  const problem = await detectProductPageProblem(page, page.url());
+  if (!problem) return;
+  if (problem.code === 'network_error' && await hasProductLinks(page, config)) {
+    console.warn(`${stage}仍看到网络提示，但商品列表已加载；继续读取当前已显示商品。`);
+    return;
+  }
+  const message = problem.code === 'item_gone'
+    ? 'Temu商品列表在加载过程中变成“Oops! The items are gone”。请从Temu首页重新进入类目，并检查网络、VPN或当前会话。'
+    : problem.message;
+  throw new Error(`${stage}检测到Temu页面异常：${message}`);
+}
+
+async function catalogLinkSignature(page, config) {
+  return page.locator(config.selectors.productLinks).evaluateAll(anchors => anchors
+    .map(anchor => anchor.href || anchor.getAttribute('href') || '')
+    .filter(Boolean).join('\n')).catch(() => '');
+}
+
+// Both catalog capture and operator review navigation need this exact virtual-list
+// progression. It advances the last rendered product card, waits for lazy content,
+// and uses the page's own “more” control when that is the available continuation.
+export async function advanceCatalogViewport(page, config, label = '滚动加载商品') {
+  const beforeSignature = await catalogLinkSignature(page, config);
+  const links = page.locator(config.selectors.productLinks);
+  const scrolled = await links.evaluateAll(anchors => {
+    if (anchors.length === 0) return false;
+    const scrollingElement = document.scrollingElement || document.documentElement;
+    const before = scrollingElement.scrollTop;
+    let target = anchors.at(-1);
+    while (target && target !== document.body) {
+      const rect = target.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) break;
+      target = target.parentElement;
+    }
+    if (target && target !== document.body) target.scrollIntoView({ block: 'end' });
+    if (!target || target === document.body || scrollingElement.scrollTop <= before) {
+      scrollingElement.scrollTop = Math.min(
+        scrollingElement.scrollHeight - scrollingElement.clientHeight,
+        before + Math.max(600, Math.round(window.innerHeight * 0.8))
+      );
+    }
+    return true;
+  }).catch(() => false);
+  if (!scrolled) return { advanced: false, clickedMore: false, beforeSignature, afterSignature: beforeSignature };
+  await page.mouse.wheel(0, randomInteger(350, 750)).catch(() => {});
+  await humanDelay(config);
+  await handleChallenge(page, config, label);
+  await assertCatalogViewportHealthy(page, config, `${label}后`);
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await page.waitForTimeout(750);
+    await assertCatalogViewportHealthy(page, config, '等待新增商品时');
+    const afterSignature = await catalogLinkSignature(page, config);
+    if (afterSignature !== beforeSignature) {
+      return { advanced: true, clickedMore: false, beforeSignature, afterSignature };
+    }
+  }
+
+  const moreButtonName = /^(?:See|Show|View) more(?: items| products)?$/i;
+  const moreButton = page.locator('.js-category-goodsList').getByRole('button', { name: moreButtonName })
+    .or(page.getByRole('button', { name: moreButtonName }));
+  const clickedMore = await clickIfVisible(moreButton);
+  if (clickedMore) {
+    await humanDelay(config);
+    await handleChallenge(page, config, '加载更多商品');
+    await assertCatalogViewportHealthy(page, config, '点击加载更多后');
+    await page.waitForTimeout(750);
+  }
+  const afterSignature = await catalogLinkSignature(page, config);
+  return { advanced: clickedMore || afterSignature !== beforeSignature, clickedMore, beforeSignature, afterSignature };
+}
+
 async function gatherProducts(page, config, job) {
   const limit = Number(job.targetCount ?? config.targetCount);
   const found = new Map();
   let staleRounds = 0;
-  let expansionClicks = 0;
-  let lastExpansionSize = -1;
-  const maxExpansions = Number(config.browser.maxCatalogExpansions ?? 4);
-  const assertCatalogHealthy = async stage => {
-    const problem = await detectProductPageProblem(page, page.url());
-    if (!problem) return;
-    if (problem.code === 'network_error' && await hasProductLinks(page, config)) {
-      console.warn(`${stage}仍看到网络提示，但商品列表已加载；继续读取当前已显示商品。`);
-      return;
-    }
-    const message = problem.code === 'item_gone'
-      ? 'Temu商品列表在加载过程中变成“Oops! The items are gone”。请从Temu首页重新进入类目，并检查网络、VPN或当前会话。'
-      : problem.message;
-    throw new Error(`${stage}检测到Temu页面异常：${message} 原商品池未作任何修改。`);
-  };
   const addItems = items => {
     const before = found.size;
     for (const item of items) {
@@ -511,70 +569,25 @@ async function gatherProducts(page, config, job) {
     }
     return found.size - before;
   };
-  const productLinkCount = () => page.locator(config.selectors.productLinks).count().catch(() => 0);
-  const scrollToLastProduct = async () => {
-    const links = page.locator(config.selectors.productLinks);
-    const count = await links.count().catch(() => 0);
-    if (count === 0) return false;
-    // Temu may keep the final cards in the DOM while their link nodes are still
-    // zero-sized lazy placeholders. Playwright's actionability check then waits
-    // for the last link to become visible and times out even though the catalog
-    // is healthy. Scroll the nearest rendered card (or advance the document)
-    // directly so lazy rendering and the next catalog batch can be triggered.
-    const scrolled = await links.evaluateAll(anchors => {
-      if (anchors.length === 0) return false;
-      const scrollingElement = document.scrollingElement || document.documentElement;
-      const before = scrollingElement.scrollTop;
-      let target = anchors.at(-1);
-      while (target && target !== document.body) {
-        const rect = target.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) break;
-        target = target.parentElement;
-      }
-      if (target && target !== document.body) target.scrollIntoView({ block: 'end' });
-
-      // Never let scrollIntoView move a catalog that is already near its end
-      // backwards merely because the final link has just become rendered.
-      const after = scrollingElement.scrollTop;
-      if (!target || target === document.body || after <= before) {
-        scrollingElement.scrollTop = Math.min(
-          scrollingElement.scrollHeight - scrollingElement.clientHeight,
-          before + Math.max(600, Math.round(window.innerHeight * 0.8))
-        );
-      }
-      return true;
-    }).catch(() => false);
-    if (scrolled) await page.mouse.wheel(0, randomInteger(350, 750)).catch(() => {});
-    return scrolled;
-  };
-  const waitForMoreProductLinks = async beforeCount => {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await page.waitForTimeout(750);
-      await assertCatalogHealthy('等待新增商品时');
-      if (await productLinkCount() > beforeCount) return true;
-    }
-    return false;
-  };
   await page.evaluate(() => {
     const scrollingElement = document.scrollingElement || document.documentElement;
     scrollingElement.scrollTop = 0;
     window.scrollTo(0, 0);
   }).catch(() => {});
   await humanDelay(config);
-  await assertCatalogHealthy('开始采集前');
+  await assertCatalogViewportHealthy(page, config, '开始采集前');
   console.log('已回到商品列表顶部，将从第一批开始累计，避免 Temu 虚拟列表漏掉前 40 个商品。');
   while (found.size < limit && staleRounds < config.browser.maxStaleRounds) {
-    await assertCatalogHealthy('本轮滚动前');
+    await assertCatalogViewportHealthy(page, config, '本轮滚动前');
     const addedAtCurrentPosition = addItems(await collectListingPage(page, config, job));
     if (found.size >= limit) break;
 
-    const countBeforeScroll = await productLinkCount();
-    const scrolled = await scrollToLastProduct();
-    if (!scrolled) throw new Error('当前商品列表已找不到商品链接，采集立即停止，原商品池未作任何修改。');
-    await humanDelay(config);
-    await handleChallenge(page, config, '滚动加载商品');
-    await assertCatalogHealthy('本轮滚动后');
-    await waitForMoreProductLinks(countBeforeScroll);
+    const advance = await advanceCatalogViewport(page, config);
+    if (!advance.advanced) {
+      staleRounds += 1;
+      process.stdout.write(`发现商品 ${found.size}/${limit}，连续无新增 ${staleRounds}/${config.browser.maxStaleRounds}\r`);
+      continue;
+    }
     const addedAfterScroll = addItems(await collectListingPage(page, config, job));
 
     if (addedAtCurrentPosition + addedAfterScroll > 0) {
@@ -583,27 +596,11 @@ async function gatherProducts(page, config, job) {
       continue;
     }
 
-    if (found.size !== lastExpansionSize && expansionClicks < maxExpansions) {
-      const moreButtonName = /^(?:See|Show|View) more(?: items|products)?$/i;
-      const moreButton = page.locator('.js-category-goodsList').getByRole('button', { name: moreButtonName })
-        .or(page.getByRole('button', { name: moreButtonName }));
-      if (await clickIfVisible(moreButton)) {
-        expansionClicks += 1;
-        lastExpansionSize = found.size;
-        staleRounds = 0;
-        console.log(`已点击加载更多按钮（${expansionClicks}/${maxExpansions}），等待新增商品…`);
-        await humanDelay(config);
-        await handleChallenge(page, config, '加载更多商品');
-        await assertCatalogHealthy('点击加载更多后');
-        continue;
-      }
-    }
-
     staleRounds += 1;
     process.stdout.write(`发现商品 ${found.size}/${limit}，连续无新增 ${staleRounds}/${config.browser.maxStaleRounds}\r`);
   }
   process.stdout.write('\n');
-  await assertCatalogHealthy('结束采集前');
+  await assertCatalogViewportHealthy(page, config, '结束采集前');
   if (found.size < limit) {
     console.log(`Temu页面保持正常，但连续 ${staleRounds} 轮没有新增商品或可用的 See/Show/View more；当前共加载 ${found.size} 个，未达到目标 ${limit}。`);
   }
@@ -747,20 +744,36 @@ async function hoverIfVisible(locator) {
   return false;
 }
 
+export function isReviewEntryLabel(value) {
+  const text = normalizeSpace(String(value ?? ''));
+  return /^(?:Item reviews|See all reviews|View all reviews|All reviews)$/i.test(text)
+    || /^\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?$/i.test(text);
+}
+
+export function hasReviewPanelSignals(value) {
+  const text = normalizeSpace(String(value ?? ''));
+  if (/\bItem reviews\b/i.test(text)) return true;
+  const markers = ['Most recent', 'Recommended', 'Helpful']
+    .filter(marker => new RegExp(`\\b${marker}\\b`, 'i').test(text));
+  return markers.length >= 2;
+}
+
 async function visibleReviewDialog(page) {
-  const dialogs = page.locator("[role='dialog']").filter({ hasText: /Item reviews/i });
-  const count = await dialogs.count().catch(() => 0);
+  const panels = page.locator("[role='dialog'], [class*='drawer' i], [class*='modal' i]");
+  const count = Math.min(await panels.count().catch(() => 0), 30);
   for (let index = count - 1; index >= 0; index -= 1) {
-    const dialog = dialogs.nth(index);
-    if (await dialog.isVisible().catch(() => false)) return dialog;
+    const panel = panels.nth(index);
+    if (!await panel.isVisible().catch(() => false)) continue;
+    const text = await panel.innerText({ timeout: 1_500 }).catch(() => '');
+    if (hasReviewPanelSignals(text)) return panel;
   }
   return null;
 }
 
-async function extractReviewCards(page, config) {
-  const reviewDialog = await visibleReviewDialog(page);
-  const reviewRoot = reviewDialog ?? page.locator('body');
-  const primary = await reviewRoot.locator(config.selectors.reviewCard).evaluateAll((cards, selectors) => cards.map((card, index) => {
+async function extractReviewCards(page, config, reviewRoot = null) {
+  const root = reviewRoot ?? await visibleReviewDialog(page);
+  if (!root) return [];
+  const primary = await root.locator(config.selectors.reviewCard).evaluateAll((cards, selectors) => cards.map((card, index) => {
     const dateNode = card.querySelector(selectors.reviewDate);
     const textNode = card.querySelector(selectors.reviewText);
     const ratingNode = card.querySelector(selectors.reviewRating);
@@ -789,7 +802,7 @@ async function extractReviewCards(page, config) {
   const plausible = primary.filter(card => datePattern.test(card.dateText || card.rawText));
   if (plausible.length > 0) return plausible;
 
-  return reviewRoot.evaluate((body, selectors) => {
+  return root.evaluate((body, selectors) => {
     const dateSource = '\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+20\\d{2}\\b';
     const dateRegex = new RegExp(dateSource, 'i');
     const dateRegexGlobal = new RegExp(dateSource, 'gi');
@@ -839,24 +852,62 @@ async function extractReviewCards(page, config) {
   });
 }
 
-async function revealReviews(page, config) {
-  let reviewDialog = await visibleReviewDialog(page);
-  if (!reviewDialog) {
-    const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews)/i);
-    const headingCount = await headings.count().catch(() => 0);
-    if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
-    const openers = [
-      page.locator(config.selectors.reviewOpen),
-      page.getByText(/^(?:See all|View all|All)\s+reviews/i),
-      page.locator("[role='button']:has-text('reviews')")
-    ];
-    for (const opener of openers) {
-      if (await clickIfVisible(opener)) break;
+async function firstVisibleReviewEntry(page, config) {
+  const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews|Item reviews)$/i);
+  const headingCount = await headings.count().catch(() => 0);
+  if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
+  const candidates = [
+    page.locator(config.selectors.reviewOpen),
+    page.getByRole('button', { name: /Item reviews|See all reviews|View all reviews|All reviews/i }),
+    page.getByRole('link', { name: /Item reviews|See all reviews|View all reviews|All reviews|\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?/i }),
+    page.getByText(/^Item reviews$/i),
+    page.getByText(/^\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?$/i)
+  ];
+  for (const candidate of candidates) {
+    const count = Math.min(await candidate.count().catch(() => 0), 20);
+    for (let index = 0; index < count; index += 1) {
+      const entry = candidate.nth(index);
+      if (!await entry.isVisible().catch(() => false)) continue;
+      const label = await entry.innerText({ timeout: 1_000 }).catch(() => '');
+      const accessibleName = await entry.getAttribute('aria-label').catch(() => '');
+      if (!isReviewEntryLabel(label || accessibleName) && !/Item reviews|See all reviews|View all reviews|All reviews/i.test(label || accessibleName)) continue;
+      return entry;
     }
-    await page.waitForTimeout(1_000);
-    reviewDialog = await visibleReviewDialog(page);
   }
-  const reviewRoot = reviewDialog ?? page.locator('body');
+  return null;
+}
+
+export async function ensureReviewPanelOpen(page, config, options = {}) {
+  let reviewDialog = await visibleReviewDialog(page);
+  if (reviewDialog) {
+    console.log('REVIEW_PANEL=opened');
+    return reviewDialog;
+  }
+  const entry = await firstVisibleReviewEntry(page, config);
+  if (entry) {
+    console.log('REVIEW_ENTRY=found');
+    await entry.click({ timeout: 6_000 }).catch(() => {});
+  } else {
+    console.log('REVIEW_ENTRY=not_found');
+  }
+  const deadline = Date.now() + Number(options.timeoutMs ?? 7_000);
+  while (Date.now() < deadline) {
+    reviewDialog = await visibleReviewDialog(page);
+    if (reviewDialog) {
+      console.log('REVIEW_PANEL=opened');
+      return reviewDialog;
+    }
+    await page.waitForTimeout(250);
+  }
+  console.log('REVIEW_PANEL=not_open');
+  await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-not-open`).catch(() => {});
+  const error = new Error('review_panel_not_open：已识别商品页评论入口，但未在限定时间内打开评论面板。');
+  error.code = 'review_panel_not_open';
+  throw error;
+}
+
+async function revealReviews(page, config, options = {}) {
+  const reviewRoot = await ensureReviewPanelOpen(page, config, options);
   let sorted = await clickIfVisible(reviewRoot.locator(config.selectors.reviewSort));
   if (!sorted) {
     const sortTriggers = [
@@ -887,12 +938,13 @@ async function revealReviews(page, config) {
       }
     }
   }).catch(() => {});
+  return reviewRoot;
 }
 
-async function scrollReviewPanel(page) {
-  const reviewDialog = await visibleReviewDialog(page);
-  const reviewRoot = reviewDialog ?? page.locator('body');
-  return reviewRoot.evaluate(root => {
+async function scrollReviewPanel(page, reviewRoot = null) {
+  const root = reviewRoot ?? await visibleReviewDialog(page);
+  if (!root) return { moved: false, atEnd: true, scrollTop: 0, remaining: 0 };
+  return root.evaluate(root => {
     const preferred = root.querySelector("[data-scroll='true']");
     const candidates = [...root.querySelectorAll('*')].filter(element => {
       const style = getComputedStyle(element);
@@ -966,6 +1018,8 @@ function isBrowserClosedError(error) {
 
 function classifyReviewFailure(error) {
   const message = error?.message ?? String(error);
+  if (/review_panel_not_open/i.test(message)) return 'review_panel_not_open';
+  if (/review_panel_empty/i.test(message)) return 'review_panel_empty';
   if (isBrowserClosedError(error)) return 'browser_closed';
   if (/captcha|verify|verification|验证码|安全验证|登录/i.test(message)) return 'captcha_or_login';
   if (/network|connection|VPN|ERR_/i.test(message)) return 'network_error';
@@ -976,14 +1030,33 @@ function classifyReviewFailure(error) {
 }
 
 export async function gatherReviews(page, config, productUrl, options = {}) {
-  await revealReviews(page, config);
+  const reviewRoot = await revealReviews(page, config, options);
+  let initialCards = await extractReviewCards(page, config, reviewRoot);
+  if (initialCards.length === 0) {
+    await page.waitForTimeout(2_000);
+    initialCards = await extractReviewCards(page, config, reviewRoot);
+  }
+  if (initialCards.length === 0) {
+    await scrollReviewPanel(page, reviewRoot);
+    await page.waitForTimeout(1_200);
+    initialCards = await extractReviewCards(page, config, reviewRoot);
+  }
+  console.log(`REVIEW_CARDS_INITIAL=${initialCards.length}`);
+  if (initialCards.length === 0) {
+    const panelText = (await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '')).slice(0, 800);
+    console.log(`REVIEW_PANEL=empty\nREVIEW_PANEL_TEXT=${normalizeSpace(panelText)}`);
+    await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-empty`).catch(() => {});
+    const error = new Error('review_panel_empty：评论面板已打开，但等待和轻微滚动后仍没有可解析的评论卡片。');
+    error.code = 'review_panel_empty';
+    throw error;
+  }
   const cutoff = daysAgoIso(29);
   const reviews = new Map();
   let staleRounds = 0;
   let oldestSeen = null;
   const sourceProductId = String(productUrl).match(/-g-(\d+)\.html/i)?.[1] ?? '';
   for (let round = 0; round < config.browser.maxReviewPages && staleRounds < 3; round += 1) {
-    const cards = await extractReviewCards(page, config);
+    const cards = round === 0 ? initialCards : await extractReviewCards(page, config, reviewRoot);
     const viewportSignature = cards.map(card => `${card.domId}|${card.dateText}|${card.rawText}`).join('\n');
     const before = reviews.size;
     const newReviews = [];
@@ -1029,17 +1102,14 @@ export async function gatherReviews(page, config, productUrl, options = {}) {
     }
     console.log(`评论扫描 ${round + 1}/${config.browser.maxReviewPages}：当前视图=${cards.length}，本轮新增=${addedThisRound}，累计=${reviews.size}，最早=${oldestSeen ?? '未知'}。`);
     if (!options.fullHistory && oldestSeen && oldestSeen < cutoff) break;
-    const reviewDialog = await visibleReviewDialog(page);
-    const reviewRoot = reviewDialog ?? page.locator('body');
     const clicked = await clickIfVisible(reviewRoot.locator(config.selectors.reviewLoadMore));
     const scrollResult = clicked
       ? { moved: true, atEnd: false, scrollTop: null, remaining: null }
-      : await scrollReviewPanel(page);
-    if (!scrollResult.moved && !reviewDialog) await page.mouse.wheel(0, 2200);
+      : await scrollReviewPanel(page, reviewRoot);
     const waitLimit = scrollResult.remaining != null && scrollResult.remaining > 1_200 ? 1 : 6;
     for (let waitAttempt = 0; waitAttempt < waitLimit; waitAttempt += 1) {
       await page.waitForTimeout(500);
-      const nextCards = await extractReviewCards(page, config);
+      const nextCards = await extractReviewCards(page, config, reviewRoot);
       const nextSignature = nextCards.map(card => `${card.domId}|${card.dateText}|${card.rawText}`).join('\n');
       if (nextSignature !== viewportSignature) break;
     }
@@ -1268,6 +1338,7 @@ export async function captureCurrentProductReviews(config, db) {
       && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
     const reviews = await gatherReviews(page, config, product.productUrl, {
       fullHistory,
+      diagnosticName: `current-review-${runId}`,
       onBatch: batch => upsertReviews(db, productId, batch),
       onCheckpoint: checkpoint => updateReviewCrawlCheckpoint(db, productId, checkpoint)
     });
@@ -1287,7 +1358,12 @@ export async function captureCurrentProductReviews(config, db) {
   } catch (error) {
     if (product && started) {
       const storedReviewCount = getReviewsForProduct(db, product.id).length;
-      markReviewCrawlFinished(db, product.id, 'failed', storedReviewCount, error, classifyReviewFailure(error));
+      const code = classifyReviewFailure(error);
+      if (['review_panel_not_open', 'review_panel_empty', 'verification_required', 'restricted', 'network_error'].includes(code)) {
+        markReviewCrawlDeferred(db, product.id, storedReviewCount, error, code);
+      } else {
+        markReviewCrawlFinished(db, product.id, 'failed', storedReviewCount, error, code);
+      }
     }
     recordError(db, runId, product?.productUrl ?? '', 'current-product-reviews', error);
     finishRun(db, runId, 'failed', error.stack ?? error.message);

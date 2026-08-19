@@ -134,7 +134,7 @@ function render(payload) {
     ? `结果：成功 ${summary.completed || 0} · 无评论 ${summary.noReviews || 0} · 确认售罄 ${summary.confirmedSoldOut || 0} · 待重试 ${summary.deferred || 0} · 失败 ${summary.failed || 0}`
     : '';
   elements.openExcel.disabled = !excelExists;
-  const engineLabel = reviewEngine === 'operator-review-v3' ? ' · 评论引擎 V3' : '';
+  const engineLabel = reviewEngine === 'operator-review-v4' ? ' · 评论引擎 V4' : '';
   elements.browserStatus.textContent = browserReady ? `采集 Chrome 已连接${engineLabel}` : '采集 Chrome 未连接';
   elements.browserPulse.classList.toggle('offline', !browserReady);
   elements.openBrowser.textContent = browserReady ? '采集 Chrome 已打开' : '打开采集 Chrome';

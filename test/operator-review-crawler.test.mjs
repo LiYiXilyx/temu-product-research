@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance } from '../src/operator-review-crawler.mjs';
+import { hasReviewPanelSignals, isReviewEntryLabel } from '../src/crawler.mjs';
 
 test('operator review crawler matches Temu product ids from both URL formats', () => {
   assert.equal(goodsIdFromUrl('https://www.temu.com/de-en/example-g-601099602102774.html'), '601099602102774');
@@ -19,7 +20,7 @@ test('operator batch requires 80 percent review-data success', () => {
   assert.equal(reviewBatchAcceptance({ ...base, completed: 7, deferred: 2 }, 8).partial, true);
 });
 
-test('all light-review package and CMD entries use the operator v3 command', async () => {
+test('all light-review package and CMD entries use the operator v4 command', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   for (const scriptName of ['reviews', 'reviews:light', 'reviews:quick', 'reviews:retry']) {
     assert.match(packageJson.scripts[scriptName], /operator-reviews/);
@@ -31,9 +32,26 @@ test('all light-review package and CMD entries use the operator v3 command', asy
   assert.match(retryCmd, /npm\.cmd run reviews:retry/);
 });
 
-test('CLI routes every non-deep reviews command into the operator v3 crawler', async () => {
+test('CLI routes every non-deep reviews command into the operator crawler', async () => {
   const cli = await readFile(new URL('../src/cli.mjs', import.meta.url), 'utf8');
   assert.match(cli, /if \(args\.reviewMode !== 'deep'\) \{\s*const result = await crawlOperatorReviews\(config, db, args\);/);
+});
+
+test('review panel helper recognizes specific review entries and panel signals', () => {
+  assert.equal(isReviewEntryLabel('Item reviews'), true);
+  assert.equal(isReviewEntryLabel('1.2K reviews'), true);
+  assert.equal(isReviewEntryLabel('Recommended products'), false);
+  assert.equal(hasReviewPanelSignals('Item reviews\nMost recent'), true);
+  assert.equal(hasReviewPanelSignals('Recommended\nMost recent\nHelpful'), true);
+  assert.equal(hasReviewPanelSignals('Recommended products only'), false);
+});
+
+test('catalog capture and operator navigation share the virtual-list advance helper', async () => {
+  const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
+  const operator = await readFile(new URL('../src/operator-review-crawler.mjs', import.meta.url), 'utf8');
+  assert.match(crawler, /export async function advanceCatalogViewport/);
+  assert.match(crawler, /await advanceCatalogViewport\(page, config\)/);
+  assert.match(operator, /await advanceCatalogViewport\(page, config/);
 });
 
 test('dashboard light and retry tasks invoke the operator crawler, while deep stays separate', async () => {
