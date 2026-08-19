@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance } from '../src/operator-review-crawler.mjs';
-import { hasReviewPanelSignals, isReviewEntryLabel } from '../src/crawler.mjs';
+import { goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance, shouldStopOperatorBatch } from '../src/operator-review-crawler.mjs';
+import { canClickCatalogSeeMore, createCatalogState, hasReviewPanelSignals, isReviewEntryLabel, observeCatalogGoodsIds } from '../src/crawler.mjs';
 
 test('operator review crawler matches Temu product ids from both URL formats', () => {
   assert.equal(goodsIdFromUrl('https://www.temu.com/de-en/example-g-601099602102774.html'), '601099602102774');
@@ -20,7 +20,7 @@ test('operator batch requires 80 percent review-data success', () => {
   assert.equal(reviewBatchAcceptance({ ...base, completed: 7, deferred: 2 }, 8).partial, true);
 });
 
-test('all light-review package and CMD entries use the operator v4 command', async () => {
+test('all light-review package and CMD entries use the operator v5 command', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   for (const scriptName of ['reviews', 'reviews:light', 'reviews:quick', 'reviews:retry']) {
     assert.match(packageJson.scripts[scriptName], /operator-reviews/);
@@ -50,8 +50,40 @@ test('catalog capture and operator navigation share the virtual-list advance hel
   const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
   const operator = await readFile(new URL('../src/operator-review-crawler.mjs', import.meta.url), 'utf8');
   assert.match(crawler, /export async function advanceCatalogViewport/);
-  assert.match(crawler, /await advanceCatalogViewport\(page, config\)/);
+  assert.match(crawler, /await advanceCatalogViewport\(page, config,[^\n]+catalogState\)/);
   assert.match(operator, /await advanceCatalogViewport\(page, config/);
+});
+
+test('catalog progress uses new unique goods ids instead of changing DOM signatures', () => {
+  const state = createCatalogState(2);
+  assert.deepEqual(observeCatalogGoodsIds(state, ['101', '102']).newGoodsIds, ['101', '102']);
+  assert.equal(state.noNewUniqueRounds, 0);
+  assert.deepEqual(observeCatalogGoodsIds(state, ['102', '101']).newGoodsIds, []);
+  assert.equal(state.noNewUniqueRounds, 1);
+  assert.deepEqual(observeCatalogGoodsIds(state, ['102', '103']).newGoodsIds, ['103']);
+  assert.equal(state.noNewUniqueRounds, 0);
+});
+
+test('catalog See more has one shared hard limit', () => {
+  const state = createCatalogState(2);
+  assert.equal(canClickCatalogSeeMore(state), true);
+  state.seeMoreClicks = 2;
+  assert.equal(canClickCatalogSeeMore(state), false);
+});
+
+test('catalog unavailable stops the operator batch', () => {
+  assert.equal(shouldStopOperatorBatch('catalog_unavailable'), true);
+  assert.equal(shouldStopOperatorBatch('catalog_link_not_found'), false);
+});
+
+test('operator path has no full live-catalog scan or page-wide See more fallback', async () => {
+  const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
+  const operator = await readFile(new URL('../src/operator-review-crawler.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(operator, /collectLiveCatalogGoodsIds/);
+  assert.doesNotMatch(operator, /liveGoodsIds/);
+  assert.match(operator, /if \(shouldStopOperatorBatch\(code\)\) throw error;/);
+  assert.doesNotMatch(operator, /\.reload\s*\(/);
+  assert.doesNotMatch(crawler, /\.or\(page\.getByRole\('button', \{ name: moreButtonName \}\)\)/);
 });
 
 test('dashboard light and retry tasks invoke the operator crawler, while deep stays separate', async () => {

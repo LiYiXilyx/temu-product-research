@@ -465,30 +465,59 @@ async function ensureTopSalesSort(page, job) {
   }
 }
 
-async function assertCatalogViewportHealthy(page, config, stage) {
+export async function assertCatalogViewportHealthy(page, config, stage) {
   const problem = await detectProductPageProblem(page, page.url());
   if (!problem) return;
   if (problem.code === 'network_error' && await hasProductLinks(page, config)) {
     console.warn(`${stage}仍看到网络提示，但商品列表已加载；继续读取当前已显示商品。`);
     return;
   }
-  const message = problem.code === 'item_gone'
-    ? 'Temu商品列表在加载过程中变成“Oops! The items are gone”。请从Temu首页重新进入类目，并检查网络、VPN或当前会话。'
-    : problem.message;
-  throw new Error(`${stage}检测到Temu页面异常：${message}`);
+  if (problem.code === 'item_gone') {
+    console.error('CATALOG_UNAVAILABLE\nTemu 当前 Top Sales 页面已失效。\n请运营人员从 Temu 首页重新进入：\nMotorcycles & Powersports Accessories\n→ Top Sales');
+    const error = new Error(`catalog_unavailable：${stage}检测到 Oops! The items are gone。请运营人员人工重新进入 Top Sales。`);
+    error.code = 'catalog_unavailable';
+    throw error;
+  }
+  throw new Error(`${stage}检测到Temu页面异常：${problem.message}`);
 }
 
-async function catalogLinkSignature(page, config) {
-  return page.locator(config.selectors.productLinks).evaluateAll(anchors => anchors
-    .map(anchor => anchor.href || anchor.getAttribute('href') || '')
-    .filter(Boolean).join('\n')).catch(() => '');
+function goodsIdFromCatalogHref(value) {
+  const pathId = String(value ?? '').match(/-g-(\d+)\.html/i)?.[1];
+  if (pathId) return pathId;
+  try { return new URL(value, 'https://www.temu.com/').searchParams.get('goods_id') || ''; } catch { return ''; }
+}
+
+async function currentCatalogGoodsIds(page, config) {
+  const hrefs = await page.locator(config.selectors.productLinks).evaluateAll(anchors => anchors
+    .map(anchor => anchor.href || anchor.getAttribute('href') || '').filter(Boolean)).catch(() => []);
+  return [...new Set(hrefs.map(goodsIdFromCatalogHref).filter(Boolean))];
+}
+
+export function createCatalogState(maxSeeMoreClicks = 2) {
+  return { seenGoodsIds: new Set(), seeMoreClicks: 0, noNewUniqueRounds: 0, maxSeeMoreClicks };
+}
+
+export function observeCatalogGoodsIds(catalogState, goodsIds) {
+  const unique = [...new Set(goodsIds.map(value => String(value)).filter(Boolean))];
+  const newGoodsIds = unique.filter(goodsId => !catalogState.seenGoodsIds.has(goodsId));
+  for (const goodsId of newGoodsIds) catalogState.seenGoodsIds.add(goodsId);
+  catalogState.noNewUniqueRounds = newGoodsIds.length > 0 ? 0 : catalogState.noNewUniqueRounds + 1;
+  return { newGoodsIds, totalSeen: catalogState.seenGoodsIds.size, noNewUniqueRounds: catalogState.noNewUniqueRounds };
+}
+
+export function canClickCatalogSeeMore(catalogState) {
+  return catalogState.seeMoreClicks < catalogState.maxSeeMoreClicks;
 }
 
 // Both catalog capture and operator review navigation need this exact virtual-list
 // progression. It advances the last rendered product card, waits for lazy content,
 // and uses the page's own “more” control when that is the available continuation.
-export async function advanceCatalogViewport(page, config, label = '滚动加载商品') {
-  const beforeSignature = await catalogLinkSignature(page, config);
+export async function advanceCatalogViewport(page, config, label = '滚动加载商品', catalogState = createCatalogState()) {
+  const beforeGoodsIds = await currentCatalogGoodsIds(page, config);
+  if (catalogState.seenGoodsIds.size === 0) {
+    for (const goodsId of beforeGoodsIds) catalogState.seenGoodsIds.add(goodsId);
+  }
+  await assertCatalogViewportHealthy(page, config, `${label}前`);
   const links = page.locator(config.selectors.productLinks);
   const scrolled = await links.evaluateAll(anchors => {
     if (anchors.length === 0) return false;
@@ -509,39 +538,51 @@ export async function advanceCatalogViewport(page, config, label = '滚动加载
     }
     return true;
   }).catch(() => false);
-  if (!scrolled) return { advanced: false, clickedMore: false, beforeSignature, afterSignature: beforeSignature };
+  if (!scrolled) {
+    const observation = observeCatalogGoodsIds(catalogState, beforeGoodsIds);
+    return { advanced: false, clickedMore: false, ...observation, catalogHealthy: true };
+  }
   await page.mouse.wheel(0, randomInteger(350, 750)).catch(() => {});
   await humanDelay(config);
   await handleChallenge(page, config, label);
   await assertCatalogViewportHealthy(page, config, `${label}后`);
 
-  for (let attempt = 0; attempt < 6; attempt += 1) {
+  let afterGoodsIds = beforeGoodsIds;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     await page.waitForTimeout(750);
     await assertCatalogViewportHealthy(page, config, '等待新增商品时');
-    const afterSignature = await catalogLinkSignature(page, config);
-    if (afterSignature !== beforeSignature) {
-      return { advanced: true, clickedMore: false, beforeSignature, afterSignature };
-    }
+    afterGoodsIds = await currentCatalogGoodsIds(page, config);
+    if (afterGoodsIds.some(goodsId => !catalogState.seenGoodsIds.has(goodsId))) break;
   }
 
+  const hasNewGoods = afterGoodsIds.some(goodsId => !catalogState.seenGoodsIds.has(goodsId));
   const moreButtonName = /^(?:See|Show|View) more(?: items| products)?$/i;
-  const moreButton = page.locator('.js-category-goodsList').getByRole('button', { name: moreButtonName })
-    .or(page.getByRole('button', { name: moreButtonName }));
-  const clickedMore = await clickIfVisible(moreButton);
+  const moreButton = page.locator('.js-category-goodsList').getByRole('button', { name: moreButtonName });
+  const clickedMore = !hasNewGoods && canClickCatalogSeeMore(catalogState)
+    ? await clickIfVisible(moreButton)
+    : false;
   if (clickedMore) {
+    catalogState.seeMoreClicks += 1;
     await humanDelay(config);
     await handleChallenge(page, config, '加载更多商品');
     await assertCatalogViewportHealthy(page, config, '点击加载更多后');
     await page.waitForTimeout(750);
+    afterGoodsIds = await currentCatalogGoodsIds(page, config);
   }
-  const afterSignature = await catalogLinkSignature(page, config);
-  return { advanced: clickedMore || afterSignature !== beforeSignature, clickedMore, beforeSignature, afterSignature };
+  const observation = observeCatalogGoodsIds(catalogState, afterGoodsIds);
+  return {
+    advanced: observation.newGoodsIds.length > 0,
+    clickedMore,
+    ...observation,
+    catalogHealthy: true
+  };
 }
 
 async function gatherProducts(page, config, job) {
   const limit = Number(job.targetCount ?? config.targetCount);
   const found = new Map();
   let staleRounds = 0;
+  const catalogState = createCatalogState(Number(config.browser.maxCatalogExpansions ?? 4));
   const addItems = items => {
     const before = found.size;
     for (const item of items) {
@@ -582,7 +623,7 @@ async function gatherProducts(page, config, job) {
     const addedAtCurrentPosition = addItems(await collectListingPage(page, config, job));
     if (found.size >= limit) break;
 
-    const advance = await advanceCatalogViewport(page, config);
+    const advance = await advanceCatalogViewport(page, config, '滚动加载商品', catalogState);
     if (!advance.advanced) {
       staleRounds += 1;
       process.stdout.write(`发现商品 ${found.size}/${limit}，连续无新增 ${staleRounds}/${config.browser.maxStaleRounds}\r`);

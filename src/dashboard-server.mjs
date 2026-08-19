@@ -14,7 +14,7 @@ const primaryExcelPath = path.join(outputDir, 'Temu第一周选品结果.xlsx');
 const configPath = path.join(projectDir, 'config.json');
 const host = '127.0.0.1';
 const port = Number(process.env.TEMU_DASHBOARD_PORT || 37821);
-const reviewEngine = 'operator-review-v4';
+const reviewEngine = 'operator-review-v5';
 
 const taskDefinitions = {
   capture: {
