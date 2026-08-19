@@ -58,6 +58,30 @@ async function navigateTemu(page, url) {
   }
 }
 
+function navigationPageState(body) {
+  const text = normalizeSpace(body);
+  if (CHALLENGE_PATTERN.test(text) || BLOCKER_URL_PATTERN.test(text)) return '需要人工验证';
+  if (/This item is sold out|currently unavailable|item is unavailable|unavailable for purchase|out of stock/i.test(text)) return '当前会话显示不可售';
+  if (/Oops!?\s*The items? (?:are|is) gone|Try again to find items/i.test(text)) return '链接已跳转到空页面';
+  if (/Please check your network connection and try again|network error|connection error/i.test(text)) return '网络异常';
+  if (/access denied|unusual traffic|temporarily restricted|too many requests/i.test(text)) return '访问受限';
+  return '未发现异常文案';
+}
+
+async function logProductNavigation(page, product, stage) {
+  const sourceCardHref = product.raw?.sourceCardHref || '历史商品未保存原始卡片 href';
+  const title = await page.title().catch(() => '无法读取标题');
+  const body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+  console.log([
+    `URL诊断（${stage}，Top Sales #${product.listingRank ?? '-'}）`,
+    `原始卡片 href: ${sourceCardHref}`,
+    `数据库 URL: ${product.productUrl}`,
+    `最终 URL: ${page.url()}`,
+    `页面标题: ${title}`,
+    `页面状态: ${navigationPageState(body)}`
+  ].join('\n'));
+}
+
 async function promptEnter(message) {
   const prompt = readline.createInterface({ input, output });
   await prompt.question(message);
@@ -443,6 +467,7 @@ async function gatherProducts(page, config, job) {
   const addItems = items => {
     const before = found.size;
     for (const item of items) {
+      const sourceCardHref = String(item.href ?? '');
       const productUrl = canonicalProductUrl(item.href);
       if (!productUrl || found.has(productUrl)) continue;
       found.set(productUrl, {
@@ -458,7 +483,10 @@ async function gatherProducts(page, config, job) {
         primaryCategory: job.primaryCategory,
         subcategory: job.subcategory,
         sortOrder: job.sortOrder,
-        raw: { cardText: item.cardText }
+        // Keep the unmodified card URL as diagnostic evidence. productUrl is the
+        // canonical database key, but Temu may respond differently to a direct
+        // canonical URL than to an in-site card navigation.
+        raw: { cardText: item.cardText, sourceCardHref, canonicalProductUrl: productUrl }
       });
     }
     return found.size - before;
@@ -1322,8 +1350,10 @@ export async function crawlReviews(config, db, options = {}) {
         console.log(`批量进度 ${index + 1}/${candidates.length}：Top Sales #${product.listingRank ?? '-'} ${product.title.slice(0, 70)}`);
         if (detailPage.isClosed()) throw new Error('Target page, context or browser has been closed');
         await navigateTemu(detailPage, product.productUrl);
+        await logProductNavigation(detailPage, product, '直接访问后');
         await handleChallenge(detailPage, config, `评论商品 ${index + 1}/${candidates.length}`);
         await sleep(config.browser.minimumDelayMs);
+        await logProductNavigation(detailPage, product, '验证/等待后');
         let pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
           const resultCode = pageProblem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
