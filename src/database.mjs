@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS products (
   selected INTEGER NOT NULL DEFAULT 0,
   selection_reasons TEXT,
   catalog_active INTEGER NOT NULL DEFAULT 1,
+  availability_status TEXT NOT NULL DEFAULT 'unknown',
+  availability_checked_at TEXT,
+  availability_message TEXT,
   listing_rank INTEGER,
   source_run_id INTEGER,
   first_seen_at TEXT NOT NULL,
@@ -129,7 +132,10 @@ export function openDatabase(databasePath) {
     review_growth_signal: 'TEXT',
     fast_growing: 'INTEGER NOT NULL DEFAULT 0',
     listing_date_range_start: 'TEXT',
-    listing_date_range_end: 'TEXT'
+    listing_date_range_end: 'TEXT',
+    availability_status: "TEXT NOT NULL DEFAULT 'unknown'",
+    availability_checked_at: 'TEXT',
+    availability_message: 'TEXT'
   });
   ensureColumns(db, 'reviews', {
     variant: 'TEXT', reviewer_region: 'TEXT',
@@ -141,9 +147,29 @@ export function openDatabase(databasePath) {
     result_code: 'TEXT', checkpoint_page_index: 'INTEGER NOT NULL DEFAULT 0',
     checkpoint_oldest_date: 'TEXT', checkpoint_review_count: 'INTEGER NOT NULL DEFAULT 0', checkpoint_json: 'TEXT'
   });
+  backfillAvailabilityFromReviewState(db);
   db.exec('CREATE INDEX IF NOT EXISTS idx_products_catalog_active ON products(catalog_active, site_country, primary_category, subcategory)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_products_availability ON products(catalog_active, availability_status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_reviews_content_fingerprint ON reviews(product_id, content_fingerprint)');
   return db;
+}
+
+function backfillAvailabilityFromReviewState(db) {
+  db.exec(`
+    UPDATE products
+    SET
+      availability_status=CASE
+        WHEN (SELECT result_code FROM review_crawl_state WHERE product_id=products.id)='sold_out' THEN 'sold_out'
+        ELSE 'invalid_link'
+      END,
+      availability_checked_at=(SELECT last_finished_at FROM review_crawl_state WHERE product_id=products.id),
+      availability_message='从已有评论抓取结果回填'
+    WHERE COALESCE(availability_status,'unknown')='unknown'
+      AND id IN (
+        SELECT product_id FROM review_crawl_state
+        WHERE result_code IN ('sold_out','invalid_link')
+      )
+  `);
 }
 
 function ensureColumns(db, tableName, definitions) {
@@ -187,6 +213,13 @@ export function upsertProduct(db, product, runId) {
   return Number(db.prepare('SELECT id FROM products WHERE product_url=?').get(product.productUrl).id);
 }
 
+export function setProductAvailability(db, productId, status, message = null) {
+  const valid = new Set(['available', 'sold_out', 'invalid_link', 'restricted', 'unknown']);
+  if (!valid.has(status)) throw new Error(`无效商品可用性状态：${status}`);
+  db.prepare(`UPDATE products SET availability_status=?,availability_checked_at=?,availability_message=? WHERE id=?`)
+    .run(status, new Date().toISOString(), message ? String(message) : null, productId);
+}
+
 export function replaceActiveCatalog(db, scope, products, runId) {
   const previousRows = db.prepare(`SELECT id,product_url AS productUrl FROM products
     WHERE catalog_active=1 AND site_country=? AND primary_category=? AND subcategory=?`)
@@ -208,6 +241,7 @@ export function replaceActiveCatalog(db, scope, products, runId) {
         catalogActive: true,
         listingRank: index + 1
       }, runId);
+      setProductAvailability(db, productId, 'available');
       activeIds.push(productId);
       if (previousIds.has(productId)) retained += 1;
       else added += 1;
@@ -365,6 +399,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       p.listing_rank AS listingRank,
       p.title,p.image_url AS imageUrl,p.price_eur AS priceEur,p.sales_count AS salesCount,
       p.rating,p.total_review_count AS totalReviewCount,p.raw_json AS rawJson,
+      COALESCE(p.availability_status,'unknown') AS availabilityStatus,
       COALESCE(s.status,'pending') AS crawlStatus,COALESCE(s.attempt_count,0) AS attemptCount,
       COALESCE(s.checkpoint_page_index,0) AS checkpointPageIndex,
       s.checkpoint_oldest_date AS checkpointOldestDate,
@@ -375,6 +410,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       AND p.product_url NOT LIKE '%goods_id=demo%'
       AND p.subcategory <> 'Demo'
       AND p.catalog_active=1
+      AND COALESCE(p.availability_status,'unknown') NOT IN ('sold_out','invalid_link')
       AND (?=0 OR p.selected=1)
       AND (
         s.status IS NULL OR s.status IN ('pending','in_progress') OR (?=1 AND s.status='failed')
@@ -402,6 +438,7 @@ export function getActiveProductByUrl(db, productUrl) {
       p.primary_category AS primaryCategory,p.subcategory,p.sort_order AS sortOrder,
       p.listing_rank AS listingRank,p.title,p.image_url AS imageUrl,p.price_eur AS priceEur,
       p.sales_count AS salesCount,p.rating,p.total_review_count AS totalReviewCount,p.raw_json AS rawJson,
+      COALESCE(p.availability_status,'unknown') AS availabilityStatus,
       (SELECT COUNT(*) FROM reviews r WHERE r.product_id=p.id) AS storedReviewCount
     FROM products p
     WHERE p.catalog_active=1 AND p.subcategory<>'Demo' AND p.product_url NOT LIKE '%goods_id=demo%'

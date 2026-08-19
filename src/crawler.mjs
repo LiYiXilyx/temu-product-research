@@ -17,6 +17,7 @@ import {
   markReviewCrawlStarted,
   recordError,
   replaceActiveCatalog,
+  setProductAvailability,
   startRun,
   updateProductAnalysis,
   updateReviewCrawlCheckpoint,
@@ -1169,6 +1170,7 @@ export async function captureCurrentProductReviews(config, db) {
     const problem = await detectProductPageProblem(page, product.productUrl);
     if (problem?.permanent) {
       const resultCode = problem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+      setProductAvailability(db, product.id, resultCode, problem.message);
       markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
         new Error(`SKIPPED: ${problem.message}`), resultCode);
       finishRun(db, runId, 'completed');
@@ -1180,6 +1182,7 @@ export async function captureCurrentProductReviews(config, db) {
 
     const enriched = await extractStructuredProduct(page, product);
     const productId = upsertProduct(db, enriched, runId);
+    setProductAvailability(db, productId, 'available');
     const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
       && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
     const reviews = await gatherReviews(page, config, product.productUrl, {
@@ -1259,6 +1262,7 @@ export async function crawl(config, db) {
           await sleep(config.browser.minimumDelayMs);
           const enriched = await extractStructuredProduct(detailPage, product);
           const productId = upsertProduct(db, enriched, runId);
+          setProductAvailability(db, productId, 'available');
           const reviews = await gatherReviews(detailPage, config, product.productUrl);
           upsertReviews(db, productId, reviews);
           updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
@@ -1323,6 +1327,7 @@ export async function crawlReviews(config, db, options = {}) {
         let pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
           const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          setProductAvailability(db, product.id, resultCode, pageProblem.message);
           markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
             new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
           skipped += 1;
@@ -1338,6 +1343,7 @@ export async function crawlReviews(config, db, options = {}) {
         pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
           const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
+          setProductAvailability(db, product.id, resultCode, pageProblem.message);
           markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
             new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
           skipped += 1;
@@ -1348,6 +1354,7 @@ export async function crawlReviews(config, db, options = {}) {
         const configuredSortOrder = config.jobs.find(job => job.subcategory === product.subcategory)?.sortOrder ?? product.sortOrder;
         const enriched = await extractStructuredProduct(detailPage, { ...product, sortOrder: configuredSortOrder });
         const productId = upsertProduct(db, enriched, runId);
+        setProductAvailability(db, productId, 'available');
         const fullHistory = reviewMode === 'deep';
         const reviews = await gatherReviews(detailPage, config, product.productUrl, {
           fullHistory,

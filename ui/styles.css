@@ -42,7 +42,7 @@ button { font: inherit; }
 .notice.error { border-color: #edb2b0; background: #fff0ef; color: #842b2b; }
 .notice.success { border-color: #a9d9c7; background: #ebf8f2; color: #12664a; }
 
-.metrics { display: grid; grid-template-columns: 1.15fr repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+.metrics { display: grid; grid-template-columns: 1.15fr repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
 .metric { min-height: 122px; padding: 20px; border: 1px solid rgba(220, 216, 207, 0.8); border-radius: 16px; background: rgba(255, 254, 250, 0.78); }
 .metric.featured { color: white; border-color: var(--ink); background: var(--ink); box-shadow: var(--shadow); }
 .metric-label { display: block; color: var(--ink-soft); font-size: 13px; }

@@ -12,6 +12,7 @@ import {
   reportProducts,
   reportReviewIssueEvidence,
   replaceReviewIssueEvidence,
+  setProductAvailability,
   startRun,
   upsertProduct,
   upsertReviews
@@ -103,6 +104,23 @@ test('deep review batches only return products marked as selected', () => {
   assert.equal(listReviewCrawlCandidates(db, {
     limit: 10, selectedOnly: true, includeReviewed: true, includeQuickCompleted: true
   }).length, 0);
+  db.close();
+});
+
+test('sold-out products leave the review queue until a fresh catalog finds them again', () => {
+  const db = openDatabase(':memory:');
+  const runId = startRun(db, { test: true });
+  const product = {
+    productUrl: 'https://www.temu.com/de-en/available-g-41.html', siteCountry: '德国', currency: 'EUR',
+    primaryCategory: 'Automotive', subcategory: 'Motorcycles & Powersports Accessories', sortOrder: 'Top Sales',
+    title: 'Availability test', imageUrl: '', priceEur: 12, salesCount: 99, rating: 4.8, totalReviewCount: 8, raw: {}
+  };
+  const productId = upsertProduct(db, product, runId);
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 1);
+  setProductAvailability(db, productId, 'sold_out', 'This item is sold out');
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 0);
+  setProductAvailability(db, productId, 'available');
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 })[0].id, productId);
   db.close();
 });
 

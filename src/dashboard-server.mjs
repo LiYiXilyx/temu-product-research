@@ -287,7 +287,7 @@ function continueTask() {
 
 function databaseSummary() {
   if (!fs.existsSync(databasePath)) {
-    return { activeProducts: 0, reviews: 0, pending: 0, inProgress: 0, completed: 0, failed: 0, catalogReady: false, lastCatalogRefresh: null };
+    return { activeProducts: 0, reviews: 0, pending: 0, inProgress: 0, completed: 0, failed: 0, unavailable: 0, catalogReady: false, lastCatalogRefresh: null };
   }
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
@@ -296,6 +296,9 @@ function databaseSummary() {
       WHERE catalog_active=1 AND product_url NOT LIKE '%goods_id=demo%' AND subcategory<>'Demo'`).get();
     const reviewRow = db.prepare(`SELECT COUNT(*) AS count FROM reviews r JOIN products p ON p.id=r.product_id
       WHERE p.catalog_active=1 AND p.product_url NOT LIKE '%goods_id=demo%' AND p.subcategory<>'Demo'`).get();
+    const unavailableRow = db.prepare(`SELECT COUNT(*) AS count FROM products
+      WHERE catalog_active=1 AND availability_status IN ('sold_out','invalid_link')
+        AND product_url NOT LIKE '%goods_id=demo%' AND subcategory<>'Demo'`).get();
     const progress = { pending: 0, inProgress: 0, completed: 0, failed: 0 };
     for (const row of db.prepare(`SELECT COALESCE(s.status,'untracked') AS status,COUNT(*) AS count FROM products p
       LEFT JOIN review_crawl_state s ON s.product_id=p.id
@@ -313,6 +316,7 @@ function databaseSummary() {
     return {
       activeProducts,
       reviews: Number(reviewRow.count),
+      unavailable: Number(unavailableRow.count),
       ...progress,
       catalogReady: Boolean(catalogRun?.finishedAt),
       lastCatalogRefresh: catalogRun?.finishedAt ?? null

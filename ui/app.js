@@ -3,6 +3,7 @@ const elements = {
   pending: document.querySelector('#pending'),
   completed: document.querySelector('#completed'),
   failed: document.querySelector('#failed'),
+  unavailable: document.querySelector('#unavailable'),
   reviews: document.querySelector('#reviews'),
   notice: document.querySelector('#notice'),
   lastRefresh: document.querySelector('#lastRefresh'),
@@ -106,6 +107,7 @@ function render(payload) {
   elements.pending.textContent = number(data.pending + data.inProgress);
   elements.completed.textContent = number(data.completed);
   elements.failed.textContent = number(data.failed);
+  elements.unavailable.textContent = number(data.unavailable);
   elements.reviews.textContent = number(data.reviews);
   elements.lastRefresh.textContent = dateTime(data.lastCatalogRefresh);
   elements.taskLabel.textContent = task.label;
