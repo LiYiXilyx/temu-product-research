@@ -57,6 +57,7 @@ export function reviewBatchAcceptance(summary, requiredSuccess = 8) {
 export function classifyOperatorFailure(error) {
   const message = String(error?.message ?? error);
   if (/catalog_unavailable/i.test(message)) return 'catalog_unavailable';
+  if (/review_entry_not_clickable/i.test(message)) return 'review_entry_not_clickable';
   if (/review_panel_not_open/i.test(message)) return 'review_panel_not_open';
   if (/review_panel_empty/i.test(message)) return 'review_panel_empty';
   if (/catalog_link_not_found/i.test(message)) return 'catalog_link_not_found';
@@ -281,7 +282,7 @@ export async function crawlOperatorReviews(config, db, options = {}) {
         const stored = getReviewsForProduct(db, product.id).length;
         markReviewCrawlDeferred(db, product.id, stored, error, code);
         recordError(db, runId, product.productUrl, 'operator-review-v5', error);
-        summary[['verification_required', 'restricted', 'network_error', 'review_panel_not_open', 'review_panel_empty', 'catalog_link_not_found', 'sold_out_unconfirmed', 'session_unavailable', 'catalog_unavailable'].includes(code) ? 'deferred' : 'failed'] += 1;
+        summary[['verification_required', 'restricted', 'network_error', 'review_entry_not_clickable', 'review_panel_not_open', 'review_panel_empty', 'catalog_link_not_found', 'sold_out_unconfirmed', 'session_unavailable', 'catalog_unavailable'].includes(code) ? 'deferred' : 'failed'] += 1;
         const diagnosticPage = entry.productPage ?? entry.openedPage ?? catalogPage;
         await saveSnapshot(diagnosticPage, config, `operator-review-${runId}-${index + 1}-${code}`).catch(() => {});
         await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: entry.wantedGoodsId, databaseUrl: product.productUrl, sourceHref: entry.sourceHref, entryMode: entry.mode, finalUrl: diagnosticPage.url(), finalGoodsId: goodsIdFromUrl(diagnosticPage.url()), pageState: code, reviewCount: 0, error: error.message });

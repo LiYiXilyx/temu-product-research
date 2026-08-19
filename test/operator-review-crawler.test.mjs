@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance, shouldStopOperatorBatch } from '../src/operator-review-crawler.mjs';
-import { canClickCatalogSeeMore, createCatalogState, hasReviewPanelSignals, isReviewEntryLabel, observeCatalogGoodsIds } from '../src/crawler.mjs';
+import { classifyOperatorFailure, goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance, shouldStopOperatorBatch } from '../src/operator-review-crawler.mjs';
+import { canClickCatalogSeeMore, createCatalogState, hasReviewPanelSignals, isReviewEntryLabel, isReviewInteractiveElement, observeCatalogGoodsIds } from '../src/crawler.mjs';
 
 test('operator review crawler matches Temu product ids from both URL formats', () => {
   assert.equal(goodsIdFromUrl('https://www.temu.com/de-en/example-g-601099602102774.html'), '601099602102774');
@@ -44,6 +44,24 @@ test('review panel helper recognizes specific review entries and panel signals',
   assert.equal(hasReviewPanelSignals('Item reviews\nMost recent'), true);
   assert.equal(hasReviewPanelSignals('Recommended\nMost recent\nHelpful'), true);
   assert.equal(hasReviewPanelSignals('Recommended products only'), false);
+});
+
+test('review entry helper only accepts native or ARIA clickable elements', () => {
+  assert.equal(isReviewInteractiveElement('BUTTON', ''), true);
+  assert.equal(isReviewInteractiveElement('a', ''), true);
+  assert.equal(isReviewInteractiveElement('DIV', 'button'), true);
+  assert.equal(isReviewInteractiveElement('SPAN', 'link'), true);
+  assert.equal(isReviewInteractiveElement('DIV', ''), false);
+  assert.equal(isReviewInteractiveElement('SPAN', ''), false);
+});
+
+test('non-clickable review entries stay deferred with a distinct result code', async () => {
+  assert.equal(classifyOperatorFailure(new Error('review_entry_not_clickable')), 'review_entry_not_clickable');
+  const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
+  assert.match(crawler, /ancestor-or-self::\*\[self::button or self::a or @role="button" or @role="link"\]/);
+  assert.match(crawler, /REVIEW_ENTRY_CLICK=success/);
+  assert.match(crawler, /REVIEW_ENTRY_CLICK=failed/);
+  assert.doesNotMatch(crawler, /entry\.click\(\{ timeout: 6_000 \}\)\.catch/);
 });
 
 test('catalog capture and operator navigation share the virtual-list advance helper', async () => {

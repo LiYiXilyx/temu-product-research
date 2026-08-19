@@ -791,6 +791,12 @@ export function isReviewEntryLabel(value) {
     || /^\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?$/i.test(text);
 }
 
+export function isReviewInteractiveElement(tagName, role) {
+  const tag = String(tagName ?? '').toLowerCase();
+  const normalizedRole = String(role ?? '').toLowerCase();
+  return tag === 'button' || tag === 'a' || normalizedRole === 'button' || normalizedRole === 'link';
+}
+
 export function hasReviewPanelSignals(value) {
   const text = normalizeSpace(String(value ?? ''));
   if (/\bItem reviews\b/i.test(text)) return true;
@@ -897,22 +903,40 @@ async function firstVisibleReviewEntry(page, config) {
   const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews|Item reviews)$/i);
   const headingCount = await headings.count().catch(() => 0);
   if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
-  const candidates = [
+  const interactiveCandidates = [
     page.locator(config.selectors.reviewOpen),
     page.getByRole('button', { name: /Item reviews|See all reviews|View all reviews|All reviews/i }),
     page.getByRole('link', { name: /Item reviews|See all reviews|View all reviews|All reviews|\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?/i }),
-    page.getByText(/^Item reviews$/i),
-    page.getByText(/^\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?$/i)
+    page.locator('button, a, [role="button"], [role="link"]')
+      .filter({ hasText: /^(?:Item reviews|See all reviews|View all reviews|All reviews|\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?)$/i })
   ];
-  for (const candidate of candidates) {
+  for (const candidate of interactiveCandidates) {
     const count = Math.min(await candidate.count().catch(() => 0), 20);
     for (let index = 0; index < count; index += 1) {
       const entry = candidate.nth(index);
       if (!await entry.isVisible().catch(() => false)) continue;
+      const element = await entry.evaluate(node => ({ tagName: node.tagName, role: node.getAttribute('role') || '' })).catch(() => null);
+      if (!element || !isReviewInteractiveElement(element.tagName, element.role)) continue;
       const label = await entry.innerText({ timeout: 1_000 }).catch(() => '');
       const accessibleName = await entry.getAttribute('aria-label').catch(() => '');
       if (!isReviewEntryLabel(label || accessibleName) && !/Item reviews|See all reviews|View all reviews|All reviews/i.test(label || accessibleName)) continue;
       return entry;
+    }
+  }
+
+  const textCandidates = [
+    page.getByText(/^Item reviews$/i),
+    page.getByText(/^\d+(?:[.,]\d+)?\s*[kKmM]?\+?\s+reviews?$/i)
+  ];
+  for (const candidate of textCandidates) {
+    const count = Math.min(await candidate.count().catch(() => 0), 20);
+    for (let index = 0; index < count; index += 1) {
+      const textNode = candidate.nth(index);
+      if (!await textNode.isVisible().catch(() => false)) continue;
+      const clickableAncestor = textNode.locator('xpath=ancestor-or-self::*[self::button or self::a or @role="button" or @role="link"][1]');
+      if (!await clickableAncestor.isVisible().catch(() => false)) continue;
+      const element = await clickableAncestor.evaluate(node => ({ tagName: node.tagName, role: node.getAttribute('role') || '' })).catch(() => null);
+      if (element && isReviewInteractiveElement(element.tagName, element.role)) return clickableAncestor;
     }
   }
   return null;
@@ -925,13 +949,26 @@ export async function ensureReviewPanelOpen(page, config, options = {}) {
     return reviewDialog;
   }
   const entry = await firstVisibleReviewEntry(page, config);
-  if (entry) {
-    console.log('REVIEW_ENTRY=found');
-    await entry.click({ timeout: 6_000 }).catch(() => {});
-  } else {
-    console.log('REVIEW_ENTRY=not_found');
+  if (!entry) {
+    console.log('REVIEW_ENTRY=not_clickable');
+    await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-entry-not-clickable`).catch(() => {});
+    const error = new Error('review_entry_not_clickable：页面存在评论文字，但没有找到 button、a、role=button 或 role=link 的可点击入口。');
+    error.code = 'review_entry_not_clickable';
+    throw error;
   }
-  const deadline = Date.now() + Number(options.timeoutMs ?? 7_000);
+  console.log('REVIEW_ENTRY=found');
+  try {
+    await entry.click({ timeout: 6_000 });
+    console.log('REVIEW_ENTRY_CLICK=success');
+  } catch (clickError) {
+    console.log('REVIEW_ENTRY_CLICK=failed');
+    await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-entry-click-failed`).catch(() => {});
+    const error = new Error(`review_entry_not_clickable：评论入口点击失败：${clickError.message}`);
+    error.code = 'review_entry_not_clickable';
+    error.cause = clickError;
+    throw error;
+  }
+  const deadline = Date.now() + Number(options.timeoutMs ?? 8_000);
   while (Date.now() < deadline) {
     reviewDialog = await visibleReviewDialog(page);
     if (reviewDialog) {
@@ -1059,6 +1096,7 @@ function isBrowserClosedError(error) {
 
 function classifyReviewFailure(error) {
   const message = error?.message ?? String(error);
+  if (/review_entry_not_clickable/i.test(message)) return 'review_entry_not_clickable';
   if (/review_panel_not_open/i.test(message)) return 'review_panel_not_open';
   if (/review_panel_empty/i.test(message)) return 'review_panel_empty';
   if (isBrowserClosedError(error)) return 'browser_closed';
@@ -1400,7 +1438,7 @@ export async function captureCurrentProductReviews(config, db) {
     if (product && started) {
       const storedReviewCount = getReviewsForProduct(db, product.id).length;
       const code = classifyReviewFailure(error);
-      if (['review_panel_not_open', 'review_panel_empty', 'verification_required', 'restricted', 'network_error'].includes(code)) {
+      if (['review_entry_not_clickable', 'review_panel_not_open', 'review_panel_empty', 'verification_required', 'restricted', 'network_error'].includes(code)) {
         markReviewCrawlDeferred(db, product.id, storedReviewCount, error, code);
       } else {
         markReviewCrawlFinished(db, product.id, 'failed', storedReviewCount, error, code);
