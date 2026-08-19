@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { classifyOperatorFailure, goodsIdFromUrl, isExpectedGoodsPage, reviewBatchAcceptance, shouldStopOperatorBatch } from '../src/operator-review-crawler.mjs';
-import { canClickCatalogSeeMore, createCatalogState, hasReviewPanelSignals, isReviewEntryLabel, isReviewInteractiveElement, observeCatalogGoodsIds } from '../src/crawler.mjs';
+import { canClickCatalogSeeMore, createCatalogState, hasReviewPanelSignals, isReviewEntryLabel, isReviewInteractiveElement, observeCatalogGoodsIds, shouldResetReviewFilters } from '../src/crawler.mjs';
 
 test('operator review crawler matches Temu product ids from both URL formats', () => {
   assert.equal(goodsIdFromUrl('https://www.temu.com/de-en/example-g-601099602102774.html'), '601099602102774');
@@ -53,6 +53,23 @@ test('review entry helper only accepts native or ARIA clickable elements', () =>
   assert.equal(isReviewInteractiveElement('SPAN', 'link'), true);
   assert.equal(isReviewInteractiveElement('DIV', ''), false);
   assert.equal(isReviewInteractiveElement('SPAN', ''), false);
+});
+
+test('review filter helper recognizes only the empty filtered state', () => {
+  assert.equal(shouldResetReviewFilters('No results found'), true);
+  assert.equal(shouldResetReviewFilters('Try removing one or more of the filters'), true);
+  assert.equal(shouldResetReviewFilters('Item reviews Most recent 23 reviews'), false);
+});
+
+test('review filter reset stays inside the panel and retries collection only once', async () => {
+  const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
+  assert.match(crawler, /reviewRoot\.getByRole\('button', \{ name: \/\^See all reviews\$\/i \}\)/);
+  assert.match(crawler, /REVIEW_FILTER_RESET=success/);
+  assert.match(crawler, /REVIEW_FILTER_RESET=not_found/);
+  assert.match(crawler, /REVIEW_FILTER_RESET=failed/);
+  assert.match(crawler, /if \(!options\.reviewFilterRetryUsed\)/);
+  assert.match(crawler, /reviewFilterRetryUsed: true/);
+  assert.match(crawler, /REVIEW_RETRY_AFTER_FILTER_RESET=1/);
 });
 
 test('non-clickable review entries stay deferred with a distinct result code', async () => {

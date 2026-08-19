@@ -805,6 +805,11 @@ export function hasReviewPanelSignals(value) {
   return markers.length >= 2;
 }
 
+export function shouldResetReviewFilters(value) {
+  const text = normalizeSpace(String(value ?? ''));
+  return /No results found|Try removing one or more of the filters/i.test(text);
+}
+
 async function visibleReviewDialog(page) {
   const panels = page.locator("[role='dialog'], [class*='drawer' i], [class*='modal' i]");
   const count = Math.min(await panels.count().catch(() => 0), 30);
@@ -984,8 +989,7 @@ export async function ensureReviewPanelOpen(page, config, options = {}) {
   throw error;
 }
 
-async function revealReviews(page, config, options = {}) {
-  const reviewRoot = await ensureReviewPanelOpen(page, config, options);
+async function selectMostRecentReviews(page, config, reviewRoot) {
   let sorted = await clickIfVisible(reviewRoot.locator(config.selectors.reviewSort));
   if (!sorted) {
     const sortTriggers = [
@@ -1001,6 +1005,66 @@ async function revealReviews(page, config, options = {}) {
     await clickIfVisible(reviewRoot.getByText(/^Most recent$/i));
   }
   await page.waitForTimeout(1_200);
+}
+
+async function firstVisiblePanelSeeAllReviews(reviewRoot) {
+  const candidates = [
+    reviewRoot.getByRole('button', { name: /^See all reviews$/i }),
+    reviewRoot.getByRole('link', { name: /^See all reviews$/i }),
+    reviewRoot.locator('button, a, [role="button"], [role="link"]')
+      .filter({ hasText: /^See all reviews$/i })
+  ];
+  for (const candidate of candidates) {
+    const count = Math.min(await candidate.count().catch(() => 0), 12);
+    for (let index = 0; index < count; index += 1) {
+      const entry = candidate.nth(index);
+      if (!await entry.isVisible().catch(() => false)) continue;
+      const element = await entry.evaluate(node => ({
+        tagName: node.tagName,
+        role: node.getAttribute('role') || '',
+        text: (node.innerText || '').replace(/\s+/g, ' ').trim()
+      })).catch(() => null);
+      if (element && isReviewInteractiveElement(element.tagName, element.role)
+        && /^See all reviews$/i.test(element.text)) return entry;
+    }
+  }
+  return null;
+}
+
+export async function resetReviewFiltersIfNoResults(page, config, options = {}) {
+  let reviewRoot = options.reviewRoot ?? await visibleReviewDialog(page);
+  if (!reviewRoot) return { detected: false, reset: false, reviewRoot: null };
+  const panelText = await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '');
+  if (!shouldResetReviewFilters(panelText)) return { detected: false, reset: false, reviewRoot };
+  console.log('REVIEW_FILTER_STATE=no_results');
+  const seeAllReviews = await firstVisiblePanelSeeAllReviews(reviewRoot);
+  if (!seeAllReviews) {
+    console.log('REVIEW_FILTER_RESET=not_found');
+    await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-filter-reset-not-found`).catch(() => {});
+    return { detected: true, reset: false, reviewRoot };
+  }
+  try {
+    await seeAllReviews.click({ timeout: 6_000 });
+    console.log('REVIEW_FILTER_RESET=success');
+  } catch {
+    console.log('REVIEW_FILTER_RESET=failed');
+    await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-filter-reset-failed`).catch(() => {});
+    return { detected: true, reset: false, reviewRoot };
+  }
+  await page.waitForTimeout(1_500);
+  reviewRoot = await visibleReviewDialog(page);
+  if (!reviewRoot) {
+    const error = new Error('review_panel_not_open：重置评论筛选后评论面板未保持打开。');
+    error.code = 'review_panel_not_open';
+    throw error;
+  }
+  await selectMostRecentReviews(page, config, reviewRoot);
+  return { detected: true, reset: true, reviewRoot };
+}
+
+async function revealReviews(page, config, options = {}) {
+  const reviewRoot = await ensureReviewPanelOpen(page, config, options);
+  await selectMostRecentReviews(page, config, reviewRoot);
   await reviewRoot.evaluate(root => {
     const preferred = root.querySelector("[data-scroll='true']");
     if (preferred) {
@@ -1109,7 +1173,9 @@ function classifyReviewFailure(error) {
 }
 
 export async function gatherReviews(page, config, productUrl, options = {}) {
-  const reviewRoot = await revealReviews(page, config, options);
+  let reviewRoot = await revealReviews(page, config, options);
+  const initialFilterReset = await resetReviewFiltersIfNoResults(page, config, { ...options, reviewRoot });
+  reviewRoot = initialFilterReset.reviewRoot ?? reviewRoot;
   let initialCards = await extractReviewCards(page, config, reviewRoot);
   if (initialCards.length === 0) {
     await page.waitForTimeout(2_000);
@@ -1122,6 +1188,13 @@ export async function gatherReviews(page, config, productUrl, options = {}) {
   }
   console.log(`REVIEW_CARDS_INITIAL=${initialCards.length}`);
   if (initialCards.length === 0) {
+    if (!options.reviewFilterRetryUsed) {
+      const retryReset = await resetReviewFiltersIfNoResults(page, config, { ...options, reviewRoot });
+      if (retryReset.reset) {
+        console.log('REVIEW_RETRY_AFTER_FILTER_RESET=1');
+        return gatherReviews(page, config, productUrl, { ...options, reviewFilterRetryUsed: true });
+      }
+    }
     const panelText = (await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '')).slice(0, 800);
     console.log(`REVIEW_PANEL=empty\nREVIEW_PANEL_TEXT=${normalizeSpace(panelText)}`);
     await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-empty`).catch(() => {});
