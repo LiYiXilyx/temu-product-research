@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { canonicalProductUrl } from './parsers.mjs';
 import {
   closeSession,
   computeAnalysis,
@@ -33,6 +32,10 @@ export function goodsIdFromUrl(value) {
   const pathId = String(value ?? '').match(/-g-(\d+)\.html/i)?.[1];
   if (pathId) return pathId;
   try { return new URL(value).searchParams.get('goods_id') || ''; } catch { return ''; }
+}
+
+export function isExpectedGoodsPage(url, expectedGoodsId) {
+  return goodsIdFromUrl(url) === String(expectedGoodsId ?? '');
 }
 
 export function reviewBatchAcceptance(summary, requiredSuccess = 8) {
@@ -70,7 +73,7 @@ async function findTopSalesPage(context, config) {
 
 async function findCatalogLink(page, config, goodsId) {
   const selector = config.selectors.productLinks;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
     const match = await page.locator(selector).evaluateAll((anchors, wantedId) => anchors.findIndex(anchor => {
       const href = anchor.href || anchor.getAttribute('href') || '';
       return href.includes(`-g-${wantedId}.html`) || new URL(href, location.href).searchParams.get('goods_id') === wantedId;
@@ -81,27 +84,78 @@ async function findCatalogLink(page, config, goodsId) {
     if (!clickedMore) {
       await page.evaluate(() => window.scrollBy(0, Math.max(700, window.innerHeight * 0.85))).catch(() => {});
     }
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(750);
   }
   return -1;
 }
 
-async function enterFromCatalog(page, config, product) {
+export async function enterFromCatalog(catalogPage, config, product) {
   const goodsId = goodsIdFromUrl(product.productUrl);
-  if (!goodsId) return { mode: 'url-fallback', found: false };
-  const index = await findCatalogLink(page, config, goodsId);
-  if (index < 0) return { mode: 'url-fallback', found: false };
-  const link = page.locator(config.selectors.productLinks).nth(index);
-  await link.evaluate(anchor => anchor.click());
-  await page.waitForURL(url => /-g-\d+\.html/i.test(url.pathname) || /[?&]goods_id=\d+/i.test(url.search), { timeout: 20_000 })
-    .catch(() => {});
-  await page.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => {});
-  return { mode: 'top-sales-click', found: true };
+  const base = { catalogPage, wantedGoodsId: goodsId, sourceHref: '', openedInPopup: false, cleaned: false };
+  if (!goodsId) return { ...base, found: false, mode: 'catalog-link-not-found', productPage: null, reason: '数据库 URL 中没有 goods_id。' };
+  const index = await findCatalogLink(catalogPage, config, goodsId);
+  if (index < 0) return { ...base, found: false, mode: 'catalog-link-not-found', productPage: null, reason: `Top Sales 未找到 goods_id=${goodsId}。` };
+
+  const link = catalogPage.locator(config.selectors.productLinks).nth(index);
+  const sourceHref = await link.getAttribute('href').catch(() => '') || '';
+  const catalogUrlBeforeClick = catalogPage.url();
+  const context = catalogPage.context();
+  let popupPage = null;
+  const onPage = newPage => {
+    if (newPage !== catalogPage && !popupPage) popupPage = newPage;
+  };
+  context.on('page', onPage);
+  try {
+    await link.scrollIntoViewIfNeeded({ timeout: 8_000 });
+    console.log(`目标 goods_id：${goodsId}\n已找到 Top Sales 卡片\n点击方式：Playwright 正常点击`);
+    await link.click({ button: 'left', timeout: 8_000 });
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      const candidate = popupPage ?? catalogPage;
+      if (isExpectedGoodsPage(candidate.url(), goodsId)) {
+        await candidate.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => {});
+        const openedInPopup = candidate !== catalogPage;
+        console.log(`打开方式：${openedInPopup ? '新标签页' : '当前标签页'}\n已接管商品页：${candidate.url()}\n最终 goods_id：${goodsIdFromUrl(candidate.url())}`);
+        return { ...base, found: true, mode: openedInPopup ? 'top-sales-popup' : 'top-sales-same-tab', productPage: candidate, sourceHref, openedInPopup };
+      }
+      if (popupPage && popupPage.url() !== 'about:blank') break;
+      await catalogPage.waitForTimeout(150);
+    }
+    const openedPage = popupPage ?? (catalogPage.url() === catalogUrlBeforeClick ? null : catalogPage);
+    const finalUrl = openedPage?.url() ?? catalogPage.url();
+    return {
+      ...base,
+      found: false,
+      mode: 'navigation-mismatch',
+      productPage: null,
+      openedPage,
+      sourceHref,
+      reason: `期望 goods_id=${goodsId}，最终 goods_id=${goodsIdFromUrl(finalUrl) || '未知'}，URL=${finalUrl}`
+    };
+  } catch (error) {
+    return { ...base, found: false, mode: 'navigation-mismatch', productPage: null, openedPage: popupPage, sourceHref, reason: error.message };
+  } finally {
+    context.off('page', onPage);
+  }
 }
 
-async function returnToCatalog(page, config) {
-  await page.goBack({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
-  await page.locator(config.selectors.productLinks).first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
+export async function restoreCatalog(entry, config) {
+  if (!entry || entry.cleaned) return;
+  const { catalogPage, productPage, openedPage } = entry;
+  const pageToClose = productPage ?? openedPage;
+  try {
+    if (pageToClose && pageToClose !== catalogPage && !pageToClose.isClosed()) {
+      await pageToClose.close({ runBeforeUnload: true }).catch(() => {});
+      await catalogPage.bringToFront().catch(() => {});
+    } else if (productPage === catalogPage && !catalogPage.isClosed()) {
+      await catalogPage.goBack({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+    }
+    if (!catalogPage.isClosed()) {
+      await catalogPage.locator(config.selectors.productLinks).first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
+    }
+  } finally {
+    entry.cleaned = true;
+  }
 }
 
 async function writeDiagnostic(config, runId, details) {
@@ -110,18 +164,19 @@ async function writeDiagnostic(config, runId, details) {
   await fs.appendFile(path.join(dir, `operator-review-${runId}.ndjson`), `${JSON.stringify({ at: new Date().toISOString(), ...details })}\n`);
 }
 
-async function checkSoldOutFromCatalog(page, config, product, entry) {
-  if (entry.mode !== 'top-sales-click') return false;
-  await returnToCatalog(page, config);
+async function checkSoldOutFromCatalog(config, product, entry) {
+  if (!entry.found) return { confirmed: false, entry };
+  await restoreCatalog(entry, config);
+  const catalogPage = entry.catalogPage;
   // One normal catalog refresh is allowed only for the confirmation pass; it is
   // not used to evade a challenge and handleChallenge still pauses for humans.
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-  await handleChallenge(page, config, '售罄复核 Top Sales 页面');
-  const repeatedEntry = await enterFromCatalog(page, config, product);
-  if (repeatedEntry.mode !== 'top-sales-click') return false;
-  await handleChallenge(page, config, '售罄复核商品页');
-  const repeated = await detectProductPageProblem(page, product.productUrl);
-  return repeated?.code === 'sold_out';
+  await catalogPage.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+  await handleChallenge(catalogPage, config, '售罄复核 Top Sales 页面');
+  const repeatedEntry = await enterFromCatalog(catalogPage, config, product);
+  if (!repeatedEntry.found) return { confirmed: false, entry: repeatedEntry };
+  await handleChallenge(repeatedEntry.productPage, config, '售罄复核商品页');
+  const repeated = await detectProductPageProblem(repeatedEntry.productPage, product.productUrl);
+  return { confirmed: repeated?.code === 'sold_out', entry: repeatedEntry };
 }
 
 export async function crawlOperatorReviews(config, db, options = {}) {
@@ -142,28 +197,36 @@ export async function crawlOperatorReviews(config, db, options = {}) {
       return { runId, ...summary, acceptance: reviewBatchAcceptance(summary), summary: getReviewCrawlSummary(db) };
     }
     session = await openExistingOperatorContext(config);
-    const page = await findTopSalesPage(session.context, config);
-    if (!page) throw new Error('请先在采集 Chrome 打开 Germany / English / EUR 的摩托配件 Top Sales 商品列表，再点击抓取下一批。');
+    const catalogPage = await findTopSalesPage(session.context, config);
+    if (!catalogPage) throw new Error('请先在采集 Chrome 打开 Germany / English / EUR 的摩托配件 Top Sales 商品列表，再点击抓取下一批。');
     console.log(`运营版批量评论 V2：Top Sales 站内导航，商品=${candidates.length}，仅采集近30天。`);
     for (const [index, product] of candidates.entries()) {
-      let entry = { mode: 'url-fallback', found: false };
+      let entry = { catalogPage, productPage: null, mode: 'catalog-link-not-found', found: false, cleaned: false };
       let checkpoint = {};
       markReviewCrawlStarted(db, product.id, runId);
       console.log(`批量进度 ${index + 1}/${candidates.length}：Top Sales #${product.listingRank ?? '-'} ${product.title.slice(0, 70)}`);
       try {
-        entry = await enterFromCatalog(page, config, product);
+        entry = await enterFromCatalog(catalogPage, config, product);
         if (!entry.found) {
-          console.warn(`Top Sales 未找到 goods_id=${goodsIdFromUrl(product.productUrl)}，回退直接 URL；结果将保留为待复核。`);
-          await page.goto(product.productUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          const error = new Error(entry.reason || 'Top Sales 站内导航失败。');
+          const code = entry.mode === 'navigation-mismatch' ? 'navigation_mismatch' : 'catalog_link_not_found';
+          markReviewCrawlDeferred(db, product.id, product.storedReviewCount, error, code);
+          summary.deferred += 1;
+          await saveSnapshot(entry.openedPage ?? catalogPage, config, `operator-review-${runId}-${index + 1}-${code}`).catch(() => {});
+          await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: entry.wantedGoodsId, databaseUrl: product.productUrl, sourceHref: entry.sourceHref, entryMode: entry.mode, finalUrl: entry.openedPage?.url() ?? catalogPage.url(), finalGoodsId: goodsIdFromUrl(entry.openedPage?.url() ?? catalogPage.url()), pageState: code, reviewCount: 0, error: error.message });
+          console.error(`评论待重试 ${index + 1}/${candidates.length}：${code} ${error.message}`);
+          continue;
         }
-        await handleChallenge(page, config, `评论商品 ${index + 1}/${candidates.length}`);
+        const productPage = entry.productPage;
+        await handleChallenge(productPage, config, `评论商品 ${index + 1}/${candidates.length}`);
         await humanDelay(config);
-        const problem = await detectProductPageProblem(page, product.productUrl);
+        const problem = await detectProductPageProblem(productPage, product.productUrl);
         if (problem?.code === 'sold_out') {
-          const confirmed = await checkSoldOutFromCatalog(page, config, product, entry);
-          const code = confirmed ? 'sold_out_confirmed' : 'sold_out_unconfirmed';
-          const error = new Error(`${problem.message}；${confirmed ? 'Top Sales 站内点击复核仍为售罄。' : '尚未完成 Top Sales 站内复核。'}`);
-          if (confirmed) {
+          const review = await checkSoldOutFromCatalog(config, product, entry);
+          entry = review.entry;
+          const code = review.confirmed ? 'sold_out_confirmed' : 'sold_out_unconfirmed';
+          const error = new Error(`${problem.message}；${review.confirmed ? 'Top Sales 站内点击复核仍为售罄。' : '尚未完成 Top Sales 站内复核。'}`);
+          if (review.confirmed) {
             setProductAvailability(db, product.id, 'sold_out_confirmed', error.message);
             markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount, error, code);
             summary.confirmedSoldOut += 1;
@@ -171,14 +234,16 @@ export async function crawlOperatorReviews(config, db, options = {}) {
             markReviewCrawlDeferred(db, product.id, product.storedReviewCount, error, code);
             summary.deferred += 1;
           }
-          await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: goodsIdFromUrl(product.productUrl), databaseUrl: product.productUrl, entryMode: entry.mode, finalUrl: page.url(), pageState: code, reviewCount: 0 });
+          const finalUrl = entry.productPage?.url() ?? entry.openedPage?.url() ?? catalogPage.url();
+          await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: entry.wantedGoodsId, databaseUrl: product.productUrl, sourceHref: entry.sourceHref, entryMode: entry.mode, finalUrl, finalGoodsId: goodsIdFromUrl(finalUrl), pageState: code, reviewCount: 0 });
           continue;
         }
         if (problem) throw new Error(problem.message);
-        const enriched = await extractStructuredProduct(page, product);
+        const enriched = await extractStructuredProduct(productPage, product);
         const productId = upsertProduct(db, enriched, runId);
         setProductAvailability(db, productId, 'available');
-        const reviews = await gatherReviews(page, config, product.productUrl, {
+        console.log('开始抓近30天评论');
+        const reviews = await gatherReviews(productPage, config, product.productUrl, {
           fullHistory: false,
           onBatch: batch => upsertReviews(db, productId, batch),
           onCheckpoint: value => { checkpoint = value; return updateReviewCrawlCheckpoint(db, productId, value); }
@@ -191,18 +256,19 @@ export async function crawlOperatorReviews(config, db, options = {}) {
         markReviewCrawlFinished(db, productId, 'completed', stored, null, code);
         summary[stored > 0 ? 'completed' : 'noReviews'] += 1;
         summary.reviewsSeen += reviews.length;
-        await writeDiagnostic(config, runId, { productId, listingRank: product.listingRank, goodsId: goodsIdFromUrl(product.productUrl), databaseUrl: product.productUrl, entryMode: entry.mode, finalUrl: page.url(), pageState: code, reviewCount: reviews.length, oldestReviewDate: checkpoint.oldestReviewDate ?? null, verificationOccurred: false });
+        await writeDiagnostic(config, runId, { productId, listingRank: product.listingRank, goodsId: entry.wantedGoodsId, databaseUrl: product.productUrl, sourceHref: entry.sourceHref, entryMode: entry.mode, finalUrl: productPage.url(), finalGoodsId: goodsIdFromUrl(productPage.url()), pageState: code, reviewCount: reviews.length, oldestReviewDate: checkpoint.oldestReviewDate ?? null, verificationOccurred: false });
       } catch (error) {
         const code = classifyOperatorFailure(error);
         const stored = getReviewsForProduct(db, product.id).length;
         markReviewCrawlDeferred(db, product.id, stored, error, code);
         recordError(db, runId, product.productUrl, 'operator-review-v2', error);
         summary[code === 'verification_required' || code === 'restricted' || code === 'network_error' ? 'deferred' : 'failed'] += 1;
-        await saveSnapshot(page, config, `operator-review-${runId}-${index + 1}-${code}`).catch(() => {});
-        await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: goodsIdFromUrl(product.productUrl), databaseUrl: product.productUrl, entryMode: entry.mode, finalUrl: page.url(), pageState: code, reviewCount: 0, error: error.message });
+        const diagnosticPage = entry.productPage ?? entry.openedPage ?? catalogPage;
+        await saveSnapshot(diagnosticPage, config, `operator-review-${runId}-${index + 1}-${code}`).catch(() => {});
+        await writeDiagnostic(config, runId, { productId: product.id, listingRank: product.listingRank, goodsId: entry.wantedGoodsId, databaseUrl: product.productUrl, sourceHref: entry.sourceHref, entryMode: entry.mode, finalUrl: diagnosticPage.url(), finalGoodsId: goodsIdFromUrl(diagnosticPage.url()), pageState: code, reviewCount: 0, error: error.message });
         console.error(`评论待重试 ${index + 1}/${candidates.length}：${code} ${error.message}`);
       } finally {
-        if (/-g-\d+\.html/i.test(page.url()) || /[?&]goods_id=\d+/i.test(page.url())) await returnToCatalog(page, config);
+        await restoreCatalog(entry, config);
         await humanDelay(config);
       }
     }
