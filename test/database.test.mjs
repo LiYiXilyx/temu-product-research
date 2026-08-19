@@ -5,6 +5,7 @@ import {
   getActiveProductByUrl,
   getReviewsForProduct,
   listReviewCrawlCandidates,
+  markReviewCrawlDeferred,
   markReviewCrawlFinished,
   markReviewCrawlStarted,
   openDatabase,
@@ -117,8 +118,11 @@ test('session-unavailable products leave the review queue until a fresh catalog 
   };
   const productId = upsertProduct(db, product, runId);
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 1);
+  markReviewCrawlStarted(db, productId, runId);
   setProductAvailability(db, productId, 'session_unavailable', 'Collector session shows unavailable');
+  markReviewCrawlDeferred(db, productId, 0, new Error('temporary collector state'));
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 0);
+  assert.equal(getReviewCrawlSummary(db).pending, 1);
   setProductAvailability(db, productId, 'available');
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 })[0].id, productId);
   db.close();

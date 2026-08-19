@@ -496,6 +496,14 @@ export function markReviewCrawlFinished(db, productId, status, reviewCount = 0, 
       error?.stack ?? (error ? String(error) : null), productId);
 }
 
+export function markReviewCrawlDeferred(db, productId, reviewCount = 0, error = null,
+  resultCode = 'session_unavailable') {
+  db.prepare(`UPDATE review_crawl_state SET
+      status='pending',last_finished_at=?,last_review_count=?,result_code=?,last_error=? WHERE product_id=?`)
+    .run(new Date().toISOString(), Number(reviewCount ?? 0), resultCode,
+      error?.stack ?? (error ? String(error) : null), productId);
+}
+
 export function getReviewCrawlSummary(db) {
   const result = { pending: 0, inProgress: 0, completed: 0, failed: 0, resultCodes: {} };
   for (const row of db.prepare('SELECT status,COUNT(*) AS count FROM review_crawl_state GROUP BY status').all()) {
