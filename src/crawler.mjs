@@ -1031,8 +1031,8 @@ async function firstVisiblePanelSeeAllReviews(reviewRoot) {
   return null;
 }
 
-export async function resetReviewFiltersIfNoResults(page, config, options = {}) {
-  let reviewRoot = options.reviewRoot ?? await visibleReviewDialog(page);
+export async function resetReviewFiltersIfNeeded(page, reviewRoot, config, options = {}) {
+  reviewRoot ??= await visibleReviewDialog(page);
   if (!reviewRoot) return { detected: false, reset: false, reviewRoot: null };
   const panelText = await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '');
   if (!shouldResetReviewFilters(panelText)) return { detected: false, reset: false, reviewRoot };
@@ -1054,9 +1054,8 @@ export async function resetReviewFiltersIfNoResults(page, config, options = {}) 
   await page.waitForTimeout(1_500);
   reviewRoot = await visibleReviewDialog(page);
   if (!reviewRoot) {
-    const error = new Error('review_panel_not_open：重置评论筛选后评论面板未保持打开。');
-    error.code = 'review_panel_not_open';
-    throw error;
+    console.log('REVIEW_PANEL_REOPEN_AFTER_FILTER_RESET=1');
+    reviewRoot = await ensureReviewPanelOpen(page, config, options);
   }
   await selectMostRecentReviews(page, config, reviewRoot);
   return { detected: true, reset: true, reviewRoot };
@@ -1174,7 +1173,13 @@ function classifyReviewFailure(error) {
 
 export async function gatherReviews(page, config, productUrl, options = {}) {
   let reviewRoot = await revealReviews(page, config, options);
-  const initialFilterReset = await resetReviewFiltersIfNoResults(page, config, { ...options, reviewRoot });
+  let filterResetUsed = Boolean(options.reviewFilterResetUsed);
+  let filterResetAttempted = Boolean(options.reviewFilterResetAttempted);
+  const initialFilterReset = filterResetAttempted || filterResetUsed
+    ? { detected: false, reset: false, reviewRoot }
+    : await resetReviewFiltersIfNeeded(page, reviewRoot, config, options);
+  filterResetUsed ||= initialFilterReset.reset;
+  filterResetAttempted ||= initialFilterReset.detected;
   reviewRoot = initialFilterReset.reviewRoot ?? reviewRoot;
   let initialCards = await extractReviewCards(page, config, reviewRoot);
   if (initialCards.length === 0) {
@@ -1188,14 +1193,22 @@ export async function gatherReviews(page, config, productUrl, options = {}) {
   }
   console.log(`REVIEW_CARDS_INITIAL=${initialCards.length}`);
   if (initialCards.length === 0) {
-    if (!options.reviewFilterRetryUsed) {
-      const retryReset = await resetReviewFiltersIfNoResults(page, config, { ...options, reviewRoot });
+    const currentPanelText = await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '');
+    if (!filterResetUsed && !filterResetAttempted && !options.reviewFilterRetryUsed
+      && shouldResetReviewFilters(currentPanelText)) {
+      const retryReset = await resetReviewFiltersIfNeeded(page, reviewRoot, config, options);
       if (retryReset.reset) {
         console.log('REVIEW_RETRY_AFTER_FILTER_RESET=1');
-        return gatherReviews(page, config, productUrl, { ...options, reviewFilterRetryUsed: true });
+        return gatherReviews(page, config, productUrl, {
+          ...options,
+          reviewFilterResetUsed: true,
+          reviewFilterResetAttempted: true,
+          reviewFilterRetryUsed: true
+        });
       }
+      filterResetAttempted ||= retryReset.detected;
     }
-    const panelText = (await reviewRoot.innerText({ timeout: 2_000 }).catch(() => '')).slice(0, 800);
+    const panelText = currentPanelText.slice(0, 800);
     console.log(`REVIEW_PANEL=empty\nREVIEW_PANEL_TEXT=${normalizeSpace(panelText)}`);
     await saveSnapshot(page, config, `${options.diagnosticName ?? 'review-panel'}-empty`).catch(() => {});
     const error = new Error('review_panel_empty：评论面板已打开，但等待和轻微滚动后仍没有可解析的评论卡片。');

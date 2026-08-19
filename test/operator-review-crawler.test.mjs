@@ -63,11 +63,16 @@ test('review filter helper recognizes only the empty filtered state', () => {
 
 test('review filter reset stays inside the panel and retries collection only once', async () => {
   const crawler = await readFile(new URL('../src/crawler.mjs', import.meta.url), 'utf8');
+  assert.match(crawler, /export async function resetReviewFiltersIfNeeded\(page, reviewRoot, config/);
   assert.match(crawler, /reviewRoot\.getByRole\('button', \{ name: \/\^See all reviews\$\/i \}\)/);
   assert.match(crawler, /REVIEW_FILTER_RESET=success/);
   assert.match(crawler, /REVIEW_FILTER_RESET=not_found/);
   assert.match(crawler, /REVIEW_FILTER_RESET=failed/);
-  assert.match(crawler, /if \(!options\.reviewFilterRetryUsed\)/);
+  assert.match(crawler, /REVIEW_PANEL_REOPEN_AFTER_FILTER_RESET=1/);
+  assert.match(crawler, /reviewRoot = await ensureReviewPanelOpen\(page, config, options\)/);
+  assert.match(crawler, /!filterResetUsed && !filterResetAttempted && !options\.reviewFilterRetryUsed/);
+  assert.match(crawler, /reviewFilterResetUsed: true/);
+  assert.match(crawler, /reviewFilterResetAttempted: true/);
   assert.match(crawler, /reviewFilterRetryUsed: true/);
   assert.match(crawler, /REVIEW_RETRY_AFTER_FILTER_RESET=1/);
 });
