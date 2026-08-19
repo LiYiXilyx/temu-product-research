@@ -14,6 +14,7 @@ const primaryExcelPath = path.join(outputDir, 'Temu第一周选品结果.xlsx');
 const configPath = path.join(projectDir, 'config.json');
 const host = '127.0.0.1';
 const port = Number(process.env.TEMU_DASHBOARD_PORT || 37821);
+const reviewEngine = 'operator-review-v3';
 
 const taskDefinitions = {
   capture: {
@@ -452,6 +453,7 @@ const server = http.createServer(async (request, response) => {
       json(response, 200, {
         task,
         data: databaseSummary(),
+        reviewEngine,
         excelExists: Boolean(latestExcelPath()),
         browserReady: await operatorBrowserReady()
       });
@@ -511,6 +513,7 @@ server.on('error', error => {
 });
 
 server.listen(port, host, () => {
+  console.log(`Temu选品运营台版本：${reviewEngine}`);
   console.log(`Temu选品运营台：http://${host}:${port}`);
 });
 

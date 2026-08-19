@@ -30,7 +30,8 @@ async function main() {
   const args = parseArgs(process.argv);
   if (args.command === 'help') {
     console.log('用法：node src/cli.mjs <init|capture|current-review|operator-reviews|refresh|crawl|reviews|demo> --config config.json');
-    console.log('评论批次：node src/cli.mjs reviews --config config.json --batch-size 10 --review-mode quick|deep [--selected-only] [--retry-failed] [--include-reviewed]');
+    console.log('运营轻采集：node src/cli.mjs operator-reviews --config config.json --batch-size 10 [--retry-failed]');
+    console.log('深度评论：node src/cli.mjs reviews --config config.json --batch-size 10 --review-mode deep --selected-only --include-reviewed');
     return;
   }
   if (args.command === 'init') {
@@ -58,6 +59,12 @@ async function main() {
       const result = await crawl(config, db);
       console.log(`采集完成：run=${result.runId}，成功商品=${result.completed}。运行 npm run export 生成Excel。`);
     } else if (args.command === 'reviews') {
+      if (args.reviewMode !== 'deep') {
+        const result = await crawlOperatorReviews(config, db, args);
+        console.log(`运营版评论批次完成：run=${result.runId}，成功=${result.completed}，无评论=${result.noReviews}，确认售罄=${result.confirmedSoldOut}，待重试=${result.deferred}，失败=${result.failed}。`);
+        console.log(`BATCH_REVIEW_SUMMARY:${JSON.stringify({ requested: result.requested, completed: result.completed, noReviews: result.noReviews, confirmedSoldOut: result.confirmedSoldOut, deferred: result.deferred, failed: result.failed, acceptance: result.acceptance })}`);
+        return;
+      }
       const result = await crawlReviews(config, db, args);
       console.log(`评论批次完成：run=${result.runId}，成功商品=${result.completed}，跳过商品=${result.skipped}，失败商品=${result.failed}，本次扫描评论=${result.reviewsSeen}。`);
       if (result.pilotAcceptance) {

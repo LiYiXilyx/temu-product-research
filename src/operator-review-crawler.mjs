@@ -188,7 +188,9 @@ export async function crawlOperatorReviews(config, db, options = {}) {
     selectedOnly: false,
     includeQuickCompleted: false
   });
-  const runId = startRun(db, { ...config, mode: 'operator-review-v2', reviewBatch: { ...options, batchSize } });
+  console.log('REVIEW_ENGINE=operator-review-v3');
+  console.log('模式：Top Sales站内轻采集\n范围：最近30天\n直接URL回退：关闭\n人工验证：开启');
+  const runId = startRun(db, { ...config, mode: 'operator-review-v3', reviewBatch: { ...options, batchSize } });
   const summary = { requested: candidates.length, completed: 0, noReviews: 0, confirmedSoldOut: 0, deferred: 0, failed: 0, reviewsSeen: 0 };
   let session;
   try {
@@ -199,7 +201,7 @@ export async function crawlOperatorReviews(config, db, options = {}) {
     session = await openExistingOperatorContext(config);
     const catalogPage = await findTopSalesPage(session.context, config);
     if (!catalogPage) throw new Error('请先在采集 Chrome 打开 Germany / English / EUR 的摩托配件 Top Sales 商品列表，再点击抓取下一批。');
-    console.log(`运营版批量评论 V2：Top Sales 站内导航，商品=${candidates.length}，仅采集近30天。`);
+    console.log(`运营版批量评论 V3：Top Sales 站内导航，商品=${candidates.length}，仅采集近30天。`);
     for (const [index, product] of candidates.entries()) {
       let entry = { catalogPage, productPage: null, mode: 'catalog-link-not-found', found: false, cleaned: false };
       let checkpoint = {};
@@ -261,7 +263,7 @@ export async function crawlOperatorReviews(config, db, options = {}) {
         const code = classifyOperatorFailure(error);
         const stored = getReviewsForProduct(db, product.id).length;
         markReviewCrawlDeferred(db, product.id, stored, error, code);
-        recordError(db, runId, product.productUrl, 'operator-review-v2', error);
+        recordError(db, runId, product.productUrl, 'operator-review-v3', error);
         summary[code === 'verification_required' || code === 'restricted' || code === 'network_error' ? 'deferred' : 'failed'] += 1;
         const diagnosticPage = entry.productPage ?? entry.openedPage ?? catalogPage;
         await saveSnapshot(diagnosticPage, config, `operator-review-${runId}-${index + 1}-${code}`).catch(() => {});

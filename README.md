@@ -62,6 +62,8 @@ npm run export
 
 “采集当前商品”保留为调试入口：运营手动打开一个商品及评论弹窗，脚本只读取当前页，不跳转。日常生产使用运营台的“批量轻采集评论”：它从SQLite读取待处理商品，单标签顺序进入详情，默认每批10个，抓到早于30天的评论后停止；失败商品不会阻塞整批。
 
+批量轻采集统一使用 `operator-review-v3`：从当前 Top Sales 页站内点击进入商品，不使用商品 URL 回退；遇到登录、验证码或安全验证会暂停，等待运营人工处理后继续。更新代码或切换分支后，必须先关闭旧运营台进程，再重新运行 `npm run dashboard`（只刷新浏览器不会加载新代码）。首次验收可在运营台将批次选择为“3 个（验收）”。
+
 分类和市场分析标记候选商品后，使用“候选商品深度评论”。该模式只读取 `selected=1` 的商品，深入采集历史评论和1–3星差评。命令行兜底如下：
 
 ```powershell
@@ -73,7 +75,7 @@ npm run reviews:retry
 如需主动重新抓已经存在评论的商品，可运行：
 
 ```powershell
-node src/cli.mjs reviews --config config.json --batch-size 10 --review-mode quick --include-reviewed
+node src/cli.mjs operator-reviews --config config.json --batch-size 10 --include-reviewed
 ```
 
 `npm run export:qa` 会额外把五张工作表渲染为内部预览图并扫描公式错误；正常的 `npm run export` 也会检查Excel数据与公式。

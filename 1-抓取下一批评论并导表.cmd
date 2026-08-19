@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 echo 正在抓取下一批10个真实Temu商品评论...
-call npm.cmd run reviews
+call npm.cmd run reviews:light
 if errorlevel 1 goto failed
 echo 正在更新运营Excel...
 call npm.cmd run export
