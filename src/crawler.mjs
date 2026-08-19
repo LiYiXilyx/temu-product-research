@@ -38,7 +38,7 @@ function randomInteger(minimum, maximum) {
   return Math.floor(Math.random() * (high - low + 1)) + low;
 }
 
-async function humanDelay(config) {
+export async function humanDelay(config) {
   await sleep(randomInteger(config.browser.minimumDelayMs, config.browser.maximumDelayMs));
 }
 
@@ -166,7 +166,7 @@ async function openContext(config) {
   return { browser: null, context, persistent: true };
 }
 
-async function openExistingOperatorContext(config) {
+export async function openExistingOperatorContext(config) {
   const endpoint = configuredCdpEndpoint(config);
   const endpointReady = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_000) })
     .then(response => response.ok).catch(() => false);
@@ -182,14 +182,14 @@ async function openExistingOperatorContext(config) {
   return { browser, context, persistent: false };
 }
 
-async function closeSession(session) {
+export async function closeSession(session) {
   if (!session) return;
   if (session.persistent) await session.context.close().catch(() => {});
   else if (session.browser) await session.browser.close().catch(() => {});
   if (session.chromeProcess && session.chromeProcess.exitCode == null) session.chromeProcess.kill();
 }
 
-async function handleChallenge(page, config, label) {
+export async function handleChallenge(page, config, label) {
   let prompted = false;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
@@ -685,7 +685,7 @@ async function validateCurrentCatalogPage(page, config, job) {
   console.log(`已确认类目：${job.subcategory}；排序：${job.sortOrder}；当前已加载商品链接：${productLinkCount}。`);
 }
 
-async function extractStructuredProduct(page, product) {
+export async function extractStructuredProduct(page, product) {
   const data = await page.evaluate(() => {
     const jsonLd = [];
     for (const node of document.querySelectorAll('script[type="application/ld+json"]')) {
@@ -913,7 +913,7 @@ async function scrollReviewPanel(page) {
   }).catch(() => ({ moved: false, atEnd: true, scrollTop: 0, remaining: 0 }));
 }
 
-async function detectProductPageProblem(page, expectedProductUrl = '') {
+export async function detectProductPageProblem(page, expectedProductUrl = '') {
   const visibleText = async pattern => {
     const matches = page.getByText(pattern);
     const count = Math.min(await matches.count().catch(() => 0), 20);
@@ -975,7 +975,7 @@ function classifyReviewFailure(error) {
   return 'unknown_error';
 }
 
-async function gatherReviews(page, config, productUrl, options = {}) {
+export async function gatherReviews(page, config, productUrl, options = {}) {
   await revealReviews(page, config);
   const cutoff = daysAgoIso(29);
   const reviews = new Map();
@@ -1057,7 +1057,7 @@ async function gatherReviews(page, config, productUrl, options = {}) {
   return [...reviews.values()];
 }
 
-async function saveSnapshot(page, config, name) {
+export async function saveSnapshot(page, config, name) {
   if (!config.browser.saveSnapshots) return;
   const dir = path.join(config.outputDir, 'debug');
   await fs.mkdir(dir, { recursive: true });
@@ -1065,7 +1065,7 @@ async function saveSnapshot(page, config, name) {
   await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false }).catch(() => {});
 }
 
-function computeAnalysis(db, productId, enriched, config) {
+export function computeAnalysis(db, productId, enriched, config) {
   const allReviews = getReviewsForProduct(db, productId);
   const eligible = allReviews.filter(review => review.reviewDate && !Number(review.isDuplicate));
   const cutoff7 = daysAgoIso(6);

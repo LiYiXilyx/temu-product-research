@@ -93,7 +93,7 @@
           <article class="action-card">
             <span class="step-number">03</span>
             <h3>批量轻采集评论</h3>
-            <p>面向大商品池，程序按 Top Sales 顺序自动逐个进入商品，只采集近30天评论正文和7/30/90天活跃度。</p>
+            <p>从运营当前 Top Sales 列表站内进入商品，只采集近30天评论；验证、售罄和异常会明确记录并保留待重试。</p>
             <div class="action-buttons">
               <button data-task="reviews-light" class="primary-button">抓取下一批</button>
               <button data-task="retry">重试失败</button>
@@ -128,6 +128,7 @@
         <div class="progress-track"><span id="progressBar"></span></div>
         <p id="taskStep" class="task-step">请选择左侧操作开始</p>
         <p id="currentProduct" class="current-product" hidden></p>
+        <p id="batchSummary" class="task-step" hidden></p>
 
         <div class="runtime-actions">
           <button id="pauseButton" class="pause-button" hidden>暂停批次</button>

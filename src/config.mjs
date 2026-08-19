@@ -40,7 +40,9 @@ export function validateConfig(config) {
   config.reviewAnalysis.negativeMaxRating = Number(config.reviewAnalysis.negativeMaxRating ?? 3);
   config.reviewAnalysis.pilotBatchSize = Number(config.reviewAnalysis.pilotBatchSize ?? 10);
   config.reviewAnalysis.minimumPilotSuccess = Number(config.reviewAnalysis.minimumPilotSuccess ?? 8);
-  config.reviewAnalysis.pilotFullHistory = config.reviewAnalysis.pilotFullHistory !== false;
+  // Batch light collection is always bounded to the recent 30-day window.
+  // Historical review capture is reserved for the explicit deep-review task.
+  config.reviewAnalysis.pilotFullHistory = false;
   config.reviewAnalysis.fastGrowthRatio = Number(config.reviewAnalysis.fastGrowthRatio ?? 1.5);
   if (config.browser.maximumDelayMs < config.browser.minimumDelayMs) {
     throw new Error('browser.maximumDelayMs 不能小于 browser.minimumDelayMs。');

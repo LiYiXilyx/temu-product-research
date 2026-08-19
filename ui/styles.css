@@ -85,12 +85,14 @@ button { font: inherit; }
 .status-badge { border-radius: 999px; padding: 6px 10px; font-size: 11px; font-weight: 800; background: rgba(255,255,255,.1); }
 .status-badge.running { color: #ffd9bd; background: rgba(255, 106, 26, .2); }
 .status-badge.completed { color: #a5edd3; background: rgba(40, 180, 132, .17); }
+.status-badge.partial { color: #ffe1a8; background: rgba(231, 166, 43, .18); }
 .status-badge.failed { color: #ffc2c0; background: rgba(219, 69, 68, .18); }
 .status-badge.paused { color: #ffe1a8; background: rgba(231, 166, 43, .18); }
 .progress-track { height: 5px; margin: 21px 0 12px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.1); }
 .progress-track span { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--orange); transition: width .4s ease; }
 .progress-track span.running { width: 68%; animation: drift 1.4s ease-in-out infinite alternate; }
 .progress-track span.completed { width: 100%; background: #42c795; }
+.progress-track span.partial { width: 100%; background: #e7a62b; }
 .progress-track span.failed { width: 100%; background: #df5754; }
 @keyframes drift { from { transform: translateX(-18%); } to { transform: translateX(18%); } }
 .task-step { min-height: 22px; color: #afbbcd; font-size: 13px; }

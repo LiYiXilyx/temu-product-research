@@ -11,6 +11,7 @@ const elements = {
   taskBadge: document.querySelector('#taskBadge'),
   taskStep: document.querySelector('#taskStep'),
   currentProduct: document.querySelector('#currentProduct'),
+  batchSummary: document.querySelector('#batchSummary'),
   progressBar: document.querySelector('#progressBar'),
   manualGate: document.querySelector('#manualGate'),
   continueButton: document.querySelector('#continueButton'),
@@ -72,6 +73,9 @@ function renderNotice(payload) {
   } else if (task.status === 'paused') {
     elements.notice.textContent = '批次已暂停，数据库断点已保留；点击右侧“继续批次”会优先恢复未完成商品。';
     elements.notice.classList.add('show');
+  } else if (task.status === 'partial') {
+    elements.notice.textContent = '批次已结束，但成功数未达到验收阈值；待处理商品可使用“重试失败”继续。';
+    elements.notice.classList.add('show');
   } else if (task.status === 'completed') {
     elements.notice.textContent = task.kind === 'clear'
       ? '运营 Excel 内容已清除；数据库中的商品和评论仍然保留。'
@@ -113,17 +117,22 @@ function render(payload) {
   elements.taskLabel.textContent = task.label;
   elements.taskStep.textContent = task.step || '请选择左侧操作开始';
 
-  const labels = { idle: '空闲', running: task.waitingForInput ? '等待验证' : '运行中', paused: '已暂停', completed: '已完成', failed: '失败' };
+  const labels = { idle: '空闲', running: task.waitingForInput ? '等待验证' : '运行中', paused: '已暂停', completed: '验收通过', partial: '部分完成', failed: '失败' };
   elements.taskBadge.textContent = labels[task.status] || task.status;
   elements.taskBadge.className = `status-badge ${task.status}`;
   elements.progressBar.className = task.status;
   const progressPercent = task.batchProgress?.total
     ? Math.min(100, Math.max(3, task.batchProgress.current / task.batchProgress.total * 100))
-    : (task.status === 'completed' ? 100 : task.status === 'running' ? 12 : 0);
+    : (['completed', 'partial'].includes(task.status) ? 100 : task.status === 'running' ? 12 : 0);
   elements.progressBar.style.width = `${progressPercent}%`;
   elements.manualGate.hidden = !task.waitingForInput;
   elements.currentProduct.hidden = !task.currentProduct;
   elements.currentProduct.textContent = task.currentProduct ? `当前商品：${task.currentProduct}` : '';
+  const summary = task.batchSummary;
+  elements.batchSummary.hidden = !summary;
+  elements.batchSummary.textContent = summary
+    ? `结果：成功 ${summary.completed || 0} · 无评论 ${summary.noReviews || 0} · 确认售罄 ${summary.confirmedSoldOut || 0} · 待重试 ${summary.deferred || 0} · 失败 ${summary.failed || 0}`
+    : '';
   elements.openExcel.disabled = !excelExists;
   elements.browserStatus.textContent = browserReady ? '采集 Chrome 已连接' : '采集 Chrome 未连接';
   elements.browserPulse.classList.toggle('offline', !browserReady);

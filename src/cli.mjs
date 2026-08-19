@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { captureCurrentCatalog, captureCurrentProductReviews, crawl, crawlReviews, refreshCatalog } from './crawler.mjs';
+import { crawlOperatorReviews } from './operator-review-crawler.mjs';
 import { openDatabase } from './database.mjs';
 import { seedDemo } from './demo.mjs';
 
@@ -28,7 +29,7 @@ function parseArgs(argv) {
 async function main() {
   const args = parseArgs(process.argv);
   if (args.command === 'help') {
-    console.log('用法：node src/cli.mjs <init|capture|current-review|refresh|crawl|reviews|demo> --config config.json');
+    console.log('用法：node src/cli.mjs <init|capture|current-review|operator-reviews|refresh|crawl|reviews|demo> --config config.json');
     console.log('评论批次：node src/cli.mjs reviews --config config.json --batch-size 10 --review-mode quick|deep [--selected-only] [--retry-failed] [--include-reviewed]');
     return;
   }
@@ -63,6 +64,10 @@ async function main() {
         console.log(`前10商品验收：${result.pilotAcceptance.successful}/${result.pilotAcceptance.attempted} 成功，要求至少 ${result.pilotAcceptance.requiredSuccess} 个，结果=${result.pilotAcceptance.passed ? '通过' : '未通过'}。`);
       }
       console.log(`进度：${JSON.stringify(result.summary)}`);
+    } else if (args.command === 'operator-reviews') {
+      const result = await crawlOperatorReviews(config, db, args);
+      console.log(`运营版评论批次完成：run=${result.runId}，成功=${result.completed}，无评论=${result.noReviews}，确认售罄=${result.confirmedSoldOut}，待重试=${result.deferred}，失败=${result.failed}。`);
+      console.log(`BATCH_REVIEW_SUMMARY:${JSON.stringify({ requested: result.requested, completed: result.completed, noReviews: result.noReviews, confirmedSoldOut: result.confirmedSoldOut, deferred: result.deferred, failed: result.failed, acceptance: result.acceptance })}`);
     } else if (args.command === 'demo') {
       const result = seedDemo(config, db);
       console.log(`示例数据已写入：run=${result.runId}，商品=${result.completed}。`);

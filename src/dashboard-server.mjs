@@ -33,7 +33,7 @@ const taskDefinitions = {
   'reviews-light': {
     label: '批量轻采集近30天评论',
     steps: [
-      { label: '顺序抓取下一批商品近30天评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--review-mode', 'quick'] },
+      { label: '按 Top Sales 站内进入并抓取近30天评论', args: ['src/cli.mjs', 'operator-reviews', '--config', 'config.json', '--batch-size', '10'] },
       { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
     ]
   },
@@ -47,7 +47,7 @@ const taskDefinitions = {
   retry: {
     label: '重试失败评论',
     steps: [
-      { label: '重试失败商品评论', args: ['src/cli.mjs', 'reviews', '--config', 'config.json', '--batch-size', '10', '--review-mode', 'quick', '--retry-failed'] },
+      { label: '按 Top Sales 站内重试商品评论', args: ['src/cli.mjs', 'operator-reviews', '--config', 'config.json', '--batch-size', '10', '--retry-failed'] },
       { label: '更新运营 Excel', args: ['tools/build-report.mjs', '--config', 'config.json'] }
     ]
   },
@@ -149,6 +149,10 @@ function appendLog(value, source = 'info') {
       task.currentProduct = progress[3];
       task.step = `正在处理 ${progress[1]}/${progress[2]}：${progress[3]}`;
     }
+    const batchSummary = text.match(/^BATCH_REVIEW_SUMMARY:(\{.+\})$/);
+    if (batchSummary) {
+      try { task.batchSummary = JSON.parse(batchSummary[1]); } catch {}
+    }
   }
   if (task.logs.length > 400) task.logs.splice(0, task.logs.length - 400);
   if (/按\s*Enter|按回车|Press\s+Enter|点击运营台.*继续执行/i.test(cleaned)) task.waitingForInput = true;
@@ -196,10 +200,13 @@ async function runPipeline(definition) {
       }
       await runStep(step);
     }
-    task.status = 'completed';
+    const acceptance = task.batchSummary?.acceptance;
+    task.status = acceptance?.partial ? 'partial' : 'completed';
     task.exitCode = 0;
-    task.step = '全部完成';
-    appendLog(`${definition.label}已完成。`, 'success');
+    task.step = acceptance?.partial
+      ? `部分完成：${acceptance.accepted}/${acceptance.attempted} 正常处理，${acceptance.attempted - acceptance.accepted} 个待处理`
+      : '全部完成';
+    appendLog(acceptance?.partial ? `${definition.label}部分完成，未达批次验收阈值。` : `${definition.label}已完成。`, acceptance?.partial ? 'operator' : 'success');
   } catch (error) {
     if (error.code === 'TASK_PAUSED' || pauseRequested) {
       task.status = 'paused';
@@ -252,6 +259,7 @@ function startTask(kind, options = {}) {
     waitingForInput: false,
     currentProduct: null,
     batchProgress: null,
+    batchSummary: null,
     options: { batchSize: Number(options.batchSize ?? 10) },
     startedAt: new Date().toISOString(),
     finishedAt: null,

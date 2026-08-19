@@ -24,7 +24,7 @@
     "export:qa": "node tools/build-report.mjs --config config.json --render",
     "demo": "node src/cli.mjs demo --config config.json && node tools/build-report.mjs --config config.json",
     "test": "node --test",
-    "check": "node --check src/cli.mjs && node --check src/crawler.mjs && node --check src/database.mjs && node --check src/dashboard-server.mjs && node --check ui/app.js && node --check tools/build-report.mjs && node --check tools/import-live-products.mjs && node --check tools/import-live-reviews.mjs && node --check tools/migrate-top-sales.mjs"
+    "check": "node --check src/cli.mjs && node --check src/crawler.mjs && node --check src/operator-review-crawler.mjs && node --check src/database.mjs && node --check src/dashboard-server.mjs && node --check ui/app.js && node --check tools/build-report.mjs && node --check tools/import-live-products.mjs && node --check tools/import-live-reviews.mjs && node --check tools/migrate-top-sales.mjs"
   },
   "dependencies": {
     "@oai/artifact-tool": ">=2.8.6",
