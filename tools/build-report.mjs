@@ -148,7 +148,8 @@ function setColumnWidths(sheet) {
 }
 
 function reviewCrawlLabel(row) {
-  if (row.resultCode === 'sold_out') return '已售罄';
+  if (row.resultCode === 'session_unavailable') return '当前会话不可售';
+  if (row.resultCode === 'sold_out') return '当前会话显示售罄（待复核）';
   if (row.resultCode === 'no_reviews') return '无评论';
   if (row.status === 'in_progress') return '抓取中';
   if (row.status === 'failed') return '失败';
@@ -159,7 +160,9 @@ function reviewCrawlLabel(row) {
 
 function resultCodeLabel(code) {
   return ({
-    pending: '待抓取', running: '抓取中', completed: '成功', no_reviews: '无评论', sold_out: '售罄',
+    pending: '待抓取', running: '抓取中', completed: '成功', deep_completed: '深采集成功',
+    no_reviews: '无评论', deep_no_reviews: '深采集无评论',
+    session_unavailable: '当前会话不可售', sold_out: '当前会话显示售罄（待复核）',
     captcha_or_login: '验证码/登录', network_error: '网络错误', restricted: '访问受限',
     invalid_link: '链接失效', selector_error: '页面结构异常', browser_closed: '浏览器关闭',
     unknown_error: '未知错误'
@@ -416,7 +419,7 @@ async function buildWorkbook(config, products, reviews, crawlProgress, issueEvid
   ]];
   progressSheet.getRange('A2:S2').format = { fill: '#D9EAF7', font: { bold: true, color: '#1F1F1F' }, verticalAlignment: 'center' };
   progressSheet.mergeCells('A3:S3');
-  progressSheet.getRange('A3').values = [[`阶段门：前10至少 ${config.reviewAnalysis.minimumPilotSuccess} 个成功后，才扩到100个稳定性验证；1000个商品池只抓基础指标。失败分类和断点位置见下表。`]];
+  progressSheet.getRange('A3').values = [[`阶段门：前10至少 ${config.reviewAnalysis.minimumPilotSuccess} 个成功后，才扩到100个稳定性验证；1000个商品池分批轻采集近30天评论，不深抓全部历史评论。失败分类和断点位置见下表。`]];
   progressSheet.getRange('A3').format = { fill: '#FFF2CC', font: { color: '#7F6000' }, wrapText: true };
   progressSheet.getRange('A5:S5').values = [progressHeaders];
   applyHeader(progressSheet.getRange('A5:S5'));

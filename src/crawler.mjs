@@ -13,10 +13,12 @@ import {
   getReviewCrawlSummary,
   getReviewsForProduct,
   listReviewCrawlCandidates,
+  markReviewCrawlDeferred,
   markReviewCrawlFinished,
   markReviewCrawlStarted,
   recordError,
   replaceActiveCatalog,
+  setProductAvailability,
   startRun,
   updateProductAnalysis,
   updateReviewCrawlCheckpoint,
@@ -55,6 +57,30 @@ async function navigateTemu(page, url) {
     await page.waitForTimeout(1_000);
     return null;
   }
+}
+
+function navigationPageState(body) {
+  const text = normalizeSpace(body);
+  if (CHALLENGE_PATTERN.test(text) || BLOCKER_URL_PATTERN.test(text)) return '需要人工验证';
+  if (/This item is sold out|currently unavailable|item is unavailable|unavailable for purchase|out of stock/i.test(text)) return '当前会话显示不可售';
+  if (/Oops!?\s*The items? (?:are|is) gone|Try again to find items/i.test(text)) return '链接已跳转到空页面';
+  if (/Please check your network connection and try again|network error|connection error/i.test(text)) return '网络异常';
+  if (/access denied|unusual traffic|temporarily restricted|too many requests/i.test(text)) return '访问受限';
+  return '未发现异常文案';
+}
+
+async function logProductNavigation(page, product, stage) {
+  const sourceCardHref = product.raw?.sourceCardHref || '历史商品未保存原始卡片 href';
+  const title = await page.title().catch(() => '无法读取标题');
+  const body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+  console.log([
+    `URL诊断（${stage}，Top Sales #${product.listingRank ?? '-'}）`,
+    `原始卡片 href: ${sourceCardHref}`,
+    `数据库 URL: ${product.productUrl}`,
+    `最终 URL: ${page.url()}`,
+    `页面标题: ${title}`,
+    `页面状态: ${navigationPageState(body)}`
+  ].join('\n'));
 }
 
 async function promptEnter(message) {
@@ -181,7 +207,7 @@ async function handleChallenge(page, config, label) {
     if (config.browser.headless) {
       throw new Error(`${label}检测到登录或人工验证；请改为headless=false后人工处理。`);
     }
-    await promptEnter(`${label}需要登录或安全验证。请在采集浏览器中完成后按 Enter 继续（程序不会绕过验证）：`);
+    await promptEnter(`${label}需要登录或安全验证。请由运营人员在采集浏览器中人工完成，并确认页面恢复正常后按 Enter 继续；程序不会点击、刷新或绕过验证：`);
     prompted = true;
     await page.waitForTimeout(1_000);
   }
@@ -201,6 +227,24 @@ async function hasProductLinks(page, config) {
   return (await page.locator(config.selectors.productLinks).count().catch(() => 0)) > 0;
 }
 
+async function isExpectedMotorcycleListing(page, config, job) {
+  if (!await hasProductLinks(page, config)) return false;
+  const body = await page.locator('body').innerText({ timeout: 8_000 }).catch(() => '');
+  let urlEvidence = '';
+  try {
+    const current = new URL(page.url());
+    urlEvidence = decodeURIComponent(`${current.pathname} ${current.search}`);
+  } catch {}
+  const normalizedUrlEvidence = urlEvidence.toLowerCase();
+  const categoryUrlMatches = normalizedUrlEvidence.includes('motorcycles--accessories')
+    || normalizedUrlEvidence.includes('motorcycles-accessories')
+    || (normalizedUrlEvidence.includes('motorcycl') && normalizedUrlEvidence.includes('powersport'));
+  const breadcrumbMatches = /Home\s*[›>]?\s*Automotive[\s\S]{0,160}Motorcycles?\s*&\s*Powersports?\s*Accessories/i.test(body);
+  const motorcycleSearchMatches = /\/search_result\.html/i.test(urlEvidence)
+    && /(?:search_key|query)[^\s]{0,80}motorcycl/i.test(urlEvidence);
+  return categoryUrlMatches || breadcrumbMatches || motorcycleSearchMatches;
+}
+
 async function isGoneListingPage(page) {
   return hasVisibleText(page, /Oops!?\s*The items? (?:are|is) gone|Try again to find items/i);
 }
@@ -217,11 +261,6 @@ async function discoverCurrentListing(page, config, job) {
   await handleChallenge(page, config, '重新定位类目');
   const homeProblem = await resolveTransientProductProblem(page, config, '重新定位类目：', homeUrl);
   if (homeProblem && !homeProblem.permanent) throw new Error(homeProblem.message);
-  if (!homeProblem && !await isGoneListingPage(page) && await hasProductLinks(page, config)) {
-    console.log(`已采用人工恢复后的当前商品列表：${page.url()}`);
-    return page.url();
-  }
-
   const categoryTrigger = page.getByText(/^Categories$/i);
   await hoverIfVisible(categoryTrigger);
   await page.waitForTimeout(500);
@@ -238,7 +277,7 @@ async function discoverCurrentListing(page, config, job) {
     await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
     await sleep(Math.max(1_500, config.browser.minimumDelayMs));
     await handleChallenge(page, config, '重新定位类目');
-    if (!await isGoneListingPage(page) && await hasProductLinks(page, config)) {
+    if (!await isGoneListingPage(page) && await isExpectedMotorcycleListing(page, config, job)) {
       console.log(`已重新定位当前类目：${page.url()}`);
       return page.url();
     }
@@ -254,7 +293,7 @@ async function discoverCurrentListing(page, config, job) {
   const searchProblem = await resolveTransientProductProblem(page, config, '摩托配件搜索页：', searchUrl);
   if (searchProblem && !searchProblem.permanent) throw new Error(searchProblem.message);
   await page.locator(config.selectors.productLinks).first().waitFor({ state: 'attached', timeout: 30_000 }).catch(() => {});
-  if (await isGoneListingPage(page) || !await hasProductLinks(page, config)) {
+  if (await isGoneListingPage(page) || !await isExpectedMotorcycleListing(page, config, job)) {
     await saveSnapshot(page, config, 'catalog-discovery-search-failed').catch(() => {});
     throw new Error('旧类目地址已失效，并且Temu当前菜单及搜索页均未返回摩托配件商品；旧商品池未作任何修改。');
   }
@@ -266,7 +305,9 @@ async function openJobListing(page, config, job) {
   await navigateTemu(page, job.url);
   await sleep(Math.max(1_500, config.browser.minimumDelayMs));
   await handleChallenge(page, config, '商品池刷新');
-  if (!await isGoneListingPage(page) && await hasProductLinks(page, config)) return page.url();
+  await page.locator(config.selectors.productLinks).first()
+    .waitFor({ state: 'attached', timeout: 12_000 }).catch(() => {});
+  if (!await isGoneListingPage(page) && await isExpectedMotorcycleListing(page, config, job)) return page.url();
   return discoverCurrentListing(page, config, job);
 }
 
@@ -431,17 +472,22 @@ async function gatherProducts(page, config, job) {
   let expansionClicks = 0;
   let lastExpansionSize = -1;
   const maxExpansions = Number(config.browser.maxCatalogExpansions ?? 4);
-  await page.evaluate(() => {
-    const scrollingElement = document.scrollingElement || document.documentElement;
-    scrollingElement.scrollTop = 0;
-    window.scrollTo(0, 0);
-  }).catch(() => {});
-  await humanDelay(config);
-  console.log('已回到商品列表顶部，将从第一批开始累计，避免 Temu 虚拟列表漏掉前 40 个商品。');
-  while (found.size < limit && staleRounds < config.browser.maxStaleRounds) {
-    const items = await collectListingPage(page, config, job);
+  const assertCatalogHealthy = async stage => {
+    const problem = await detectProductPageProblem(page, page.url());
+    if (!problem) return;
+    if (problem.code === 'network_error' && await hasProductLinks(page, config)) {
+      console.warn(`${stage}仍看到网络提示，但商品列表已加载；继续读取当前已显示商品。`);
+      return;
+    }
+    const message = problem.code === 'item_gone'
+      ? 'Temu商品列表在加载过程中变成“Oops! The items are gone”。请从Temu首页重新进入类目，并检查网络、VPN或当前会话。'
+      : problem.message;
+    throw new Error(`${stage}检测到Temu页面异常：${message} 原商品池未作任何修改。`);
+  };
+  const addItems = items => {
     const before = found.size;
     for (const item of items) {
+      const sourceCardHref = String(item.href ?? '');
       const productUrl = canonicalProductUrl(item.href);
       if (!productUrl || found.has(productUrl)) continue;
       found.set(productUrl, {
@@ -457,58 +503,179 @@ async function gatherProducts(page, config, job) {
         primaryCategory: job.primaryCategory,
         subcategory: job.subcategory,
         sortOrder: job.sortOrder,
-        raw: { cardText: item.cardText }
+        // Keep the unmodified card URL as diagnostic evidence. productUrl is the
+        // canonical database key, but Temu may respond differently to a direct
+        // canonical URL than to an in-site card navigation.
+        raw: { cardText: item.cardText, sourceCardHref, canonicalProductUrl: productUrl }
       });
     }
-    if (found.size === before && found.size !== lastExpansionSize && expansionClicks < maxExpansions) {
-      const seeMoreName = /^See more(?: items)?$/i;
-      const seeMore = page.locator('.js-category-goodsList').getByRole('button', { name: seeMoreName })
-        .or(page.getByRole('button', { name: seeMoreName }));
-      if (await clickIfVisible(seeMore)) {
+    return found.size - before;
+  };
+  const productLinkCount = () => page.locator(config.selectors.productLinks).count().catch(() => 0);
+  const scrollToLastProduct = async () => {
+    const links = page.locator(config.selectors.productLinks);
+    const count = await links.count().catch(() => 0);
+    if (count === 0) return false;
+    // Temu may keep the final cards in the DOM while their link nodes are still
+    // zero-sized lazy placeholders. Playwright's actionability check then waits
+    // for the last link to become visible and times out even though the catalog
+    // is healthy. Scroll the nearest rendered card (or advance the document)
+    // directly so lazy rendering and the next catalog batch can be triggered.
+    const scrolled = await links.evaluateAll(anchors => {
+      if (anchors.length === 0) return false;
+      const scrollingElement = document.scrollingElement || document.documentElement;
+      const before = scrollingElement.scrollTop;
+      let target = anchors.at(-1);
+      while (target && target !== document.body) {
+        const rect = target.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) break;
+        target = target.parentElement;
+      }
+      if (target && target !== document.body) target.scrollIntoView({ block: 'end' });
+
+      // Never let scrollIntoView move a catalog that is already near its end
+      // backwards merely because the final link has just become rendered.
+      const after = scrollingElement.scrollTop;
+      if (!target || target === document.body || after <= before) {
+        scrollingElement.scrollTop = Math.min(
+          scrollingElement.scrollHeight - scrollingElement.clientHeight,
+          before + Math.max(600, Math.round(window.innerHeight * 0.8))
+        );
+      }
+      return true;
+    }).catch(() => false);
+    if (scrolled) await page.mouse.wheel(0, randomInteger(350, 750)).catch(() => {});
+    return scrolled;
+  };
+  const waitForMoreProductLinks = async beforeCount => {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await page.waitForTimeout(750);
+      await assertCatalogHealthy('等待新增商品时');
+      if (await productLinkCount() > beforeCount) return true;
+    }
+    return false;
+  };
+  await page.evaluate(() => {
+    const scrollingElement = document.scrollingElement || document.documentElement;
+    scrollingElement.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }).catch(() => {});
+  await humanDelay(config);
+  await assertCatalogHealthy('开始采集前');
+  console.log('已回到商品列表顶部，将从第一批开始累计，避免 Temu 虚拟列表漏掉前 40 个商品。');
+  while (found.size < limit && staleRounds < config.browser.maxStaleRounds) {
+    await assertCatalogHealthy('本轮滚动前');
+    const addedAtCurrentPosition = addItems(await collectListingPage(page, config, job));
+    if (found.size >= limit) break;
+
+    const countBeforeScroll = await productLinkCount();
+    const scrolled = await scrollToLastProduct();
+    if (!scrolled) throw new Error('当前商品列表已找不到商品链接，采集立即停止，原商品池未作任何修改。');
+    await humanDelay(config);
+    await handleChallenge(page, config, '滚动加载商品');
+    await assertCatalogHealthy('本轮滚动后');
+    await waitForMoreProductLinks(countBeforeScroll);
+    const addedAfterScroll = addItems(await collectListingPage(page, config, job));
+
+    if (addedAtCurrentPosition + addedAfterScroll > 0) {
+      staleRounds = 0;
+      process.stdout.write(`发现商品 ${found.size}/${limit}，滚动后已新增商品\r`);
+      continue;
+    }
+
+    if (found.size !== lastExpansionSize && expansionClicks < maxExpansions) {
+      const moreButtonName = /^(?:See|Show|View) more(?: items|products)?$/i;
+      const moreButton = page.locator('.js-category-goodsList').getByRole('button', { name: moreButtonName })
+        .or(page.getByRole('button', { name: moreButtonName }));
+      if (await clickIfVisible(moreButton)) {
         expansionClicks += 1;
         lastExpansionSize = found.size;
         staleRounds = 0;
-        console.log(`已点击 See more（${expansionClicks}/${maxExpansions}），等待加载更多商品…`);
+        console.log(`已点击加载更多按钮（${expansionClicks}/${maxExpansions}），等待新增商品…`);
         await humanDelay(config);
         await handleChallenge(page, config, '加载更多商品');
-        const problem = await detectProductPageProblem(page, page.url());
-        if (problem && !problem.permanent) throw new Error(`加载更多商品失败：${problem.message}`);
+        await assertCatalogHealthy('点击加载更多后');
         continue;
       }
     }
-    staleRounds = found.size === before ? staleRounds + 1 : 0;
+
+    staleRounds += 1;
     process.stdout.write(`发现商品 ${found.size}/${limit}，连续无新增 ${staleRounds}/${config.browser.maxStaleRounds}\r`);
-    await page.mouse.wheel(0, randomInteger(1700, 3000));
-    await humanDelay(config);
   }
   process.stdout.write('\n');
-  if (found.size < limit) console.log(`当前页面共加载 ${found.size} 个商品，未达到目标 ${limit}；没有可继续点击的 See more。`);
+  await assertCatalogHealthy('结束采集前');
+  if (found.size < limit) {
+    console.log(`Temu页面保持正常，但连续 ${staleRounds} 轮没有新增商品或可用的 See/Show/View more；当前共加载 ${found.size} 个，未达到目标 ${limit}。`);
+  }
   return [...found.values()].slice(0, limit);
 }
 
-async function findCurrentOperatorTemuPage(context) {
+function isTemuProductDetailUrl(value) {
+  try {
+    const url = new URL(value);
+    return /(^|\.)temu\.com$/i.test(url.hostname)
+      && (/-g-\d+\.html$/i.test(url.pathname) || /[?&]goods_id=\d+/i.test(url.search));
+  } catch {
+    return false;
+  }
+}
+
+async function findCurrentOperatorTemuPage(context, options = {}) {
   const pages = context.pages().filter(page => !page.isClosed());
   const temuPages = pages.filter(page => {
     try { return /(^|\.)temu\.com$/i.test(new URL(page.url()).hostname); } catch { return false; }
   });
-  for (const page of [...temuPages].reverse()) {
+
+  if (options.pageType === 'product') {
+    const productPages = temuPages.filter(page => isTemuProductDetailUrl(page.url()));
+    const pagesWithReviewDialog = [];
+    for (const page of productPages) {
+      const reviewDialogVisible = await page.getByText(/^Item reviews$/i).isVisible().catch(() => false);
+      if (reviewDialogVisible) pagesWithReviewDialog.push(page);
+    }
+    if (pagesWithReviewDialog.length === 1) return pagesWithReviewDialog[0];
+    if (pagesWithReviewDialog.length > 1) {
+      throw new Error('采集 Chrome 中有多个商品同时打开了 Item reviews。请只保留一个要采集的评论弹窗，再点击采集。');
+    }
+    if (productPages.length > 1) {
+      throw new Error('采集 Chrome 中有多个商品详情标签，无法安全判断运营当前要采集哪一个。请在目标商品中打开 Item reviews，或关闭其他商品详情标签后重试。');
+    }
+    return productPages[0] ?? null;
+  }
+
+  if (options.pageType === 'catalog') {
+    const catalogPages = temuPages.filter(page => !isTemuProductDetailUrl(page.url()));
+    if (options.config && options.job) {
+      for (const page of catalogPages) {
+        if (await isExpectedMotorcycleListing(page, options.config, options.job)) return page;
+      }
+      return null;
+    }
+    return catalogPages[0] ?? null;
+  }
+
+  for (const page of temuPages) {
     if (await page.evaluate(() => document.visibilityState === 'visible').catch(() => false)) return page;
   }
-  return temuPages.at(-1) ?? null;
+  return temuPages[0] ?? null;
 }
 
 async function validateCurrentCatalogPage(page, config, job) {
   await handleChallenge(page, config, '当前商品页');
   const problem = await detectProductPageProblem(page, page.url());
-  if (problem) throw new Error(`${problem.message} 当前页采集已停止，原商品池未作任何修改。`);
+  if (problem && !(problem.code === 'network_error' && await hasProductLinks(page, config))) {
+    throw new Error(`${problem.message} 当前页采集已停止，原商品池未作任何修改。`);
+  }
+  if (problem?.code === 'network_error') {
+    console.warn('当前页仍看到网络提示，但摩托配件商品列表已经加载；继续采集已显示商品。');
+  }
 
   const body = await page.locator('body').innerText({ timeout: 10_000 }).catch(() => '');
   const productLinkCount = await page.locator(config.selectors.productLinks).count().catch(() => 0);
   if (productLinkCount === 0) {
     throw new Error('当前 Chrome 页面没有发现商品列表。请人工打开 Temu 摩托配件类目或搜索结果，看到商品后再采集。');
   }
-  const categoryEvidence = `${page.url()} ${body.slice(0, 30_000)}`;
-  if (!/(motorcycl|motocross|powersport)/i.test(categoryEvidence)) {
+  if (!await isExpectedMotorcycleListing(page, config, job)) {
     throw new Error('当前页面不能确认是摩托配件商品池。请进入 Motorcycles & Powersports Accessories 后再采集。');
   }
   if (/^top\s*sales$/i.test(normalizeSpace(job.sortOrder)) && !/Sort\s*by\s*:?\s*Top\s*sales/i.test(body)) {
@@ -580,8 +747,20 @@ async function hoverIfVisible(locator) {
   return false;
 }
 
+async function visibleReviewDialog(page) {
+  const dialogs = page.locator("[role='dialog']").filter({ hasText: /Item reviews/i });
+  const count = await dialogs.count().catch(() => 0);
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const dialog = dialogs.nth(index);
+    if (await dialog.isVisible().catch(() => false)) return dialog;
+  }
+  return null;
+}
+
 async function extractReviewCards(page, config) {
-  const primary = await page.locator(config.selectors.reviewCard).evaluateAll((cards, selectors) => cards.map((card, index) => {
+  const reviewDialog = await visibleReviewDialog(page);
+  const reviewRoot = reviewDialog ?? page.locator('body');
+  const primary = await reviewRoot.locator(config.selectors.reviewCard).evaluateAll((cards, selectors) => cards.map((card, index) => {
     const dateNode = card.querySelector(selectors.reviewDate);
     const textNode = card.querySelector(selectors.reviewText);
     const ratingNode = card.querySelector(selectors.reviewRating);
@@ -597,7 +776,7 @@ async function extractReviewCards(page, config) {
       reviewerRegion: regionLabel.match(/\bin\s+(.+?)\s+on\s+/i)?.[1]?.trim() || '',
       isTranslated: /Review before translation:/i.test(rawText),
       imageUrls: [...card.querySelectorAll('img[src]')].map(node => node.src)
-        .filter(src => !/avatar|openingemail|upload_aimg\/commodity/i.test(src)).slice(0, 20),
+        .filter(src => /(?:rewimg|review[-_/]?(?:image|video))/i.test(src)).slice(0, 20),
       rawText,
       index
     };
@@ -610,7 +789,7 @@ async function extractReviewCards(page, config) {
   const plausible = primary.filter(card => datePattern.test(card.dateText || card.rawText));
   if (plausible.length > 0) return plausible;
 
-  return page.locator('body').evaluate((body, selectors) => {
+  return reviewRoot.evaluate((body, selectors) => {
     const dateSource = '\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+20\\d{2}\\b';
     const dateRegex = new RegExp(dateSource, 'i');
     const dateRegexGlobal = new RegExp(dateSource, 'gi');
@@ -648,7 +827,7 @@ async function extractReviewCards(page, config) {
         reviewerRegion: regionLabel.match(/\bin\s+(.+?)\s+on\s+/i)?.[1]?.trim() || '',
         isTranslated: /Review before translation:/i.test(rawText),
         imageUrls: [...element.querySelectorAll('img[src]')].map(node => node.src)
-          .filter(src => !/avatar|openingemail|upload_aimg\/commodity/i.test(src)).slice(0, 20),
+          .filter(src => /(?:rewimg|review[-_/]?(?:image|video))/i.test(src)).slice(0, 20),
         rawText,
         index
       };
@@ -661,42 +840,49 @@ async function extractReviewCards(page, config) {
 }
 
 async function revealReviews(page, config) {
-  const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews)/i);
-  const headingCount = await headings.count().catch(() => 0);
-  if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
-  const openers = [
-    page.locator(config.selectors.reviewOpen),
-    page.getByText(/^(?:See all|View all|All)\s+reviews/i),
-    page.locator("[role='button']:has-text('reviews')")
-  ];
-  for (const opener of openers) {
-    if (await clickIfVisible(opener)) break;
+  let reviewDialog = await visibleReviewDialog(page);
+  if (!reviewDialog) {
+    const headings = page.getByText(/^(?:Customer reviews|Reviews|Product reviews)/i);
+    const headingCount = await headings.count().catch(() => 0);
+    if (headingCount > 0) await headings.last().scrollIntoViewIfNeeded().catch(() => {});
+    const openers = [
+      page.locator(config.selectors.reviewOpen),
+      page.getByText(/^(?:See all|View all|All)\s+reviews/i),
+      page.locator("[role='button']:has-text('reviews')")
+    ];
+    for (const opener of openers) {
+      if (await clickIfVisible(opener)) break;
+    }
+    await page.waitForTimeout(1_000);
+    reviewDialog = await visibleReviewDialog(page);
   }
-  await page.waitForTimeout(1_000);
-
-  let sorted = /Sort by:\s*Most recent/i.test(await page.locator('body').innerText().catch(() => ''));
-  if (!sorted) sorted = await clickIfVisible(page.locator(config.selectors.reviewSort));
+  const reviewRoot = reviewDialog ?? page.locator('body');
+  let sorted = await clickIfVisible(reviewRoot.locator(config.selectors.reviewSort));
   if (!sorted) {
     const sortTriggers = [
-      page.locator("button:has-text('Recommended')"),
-      page.locator("[role='button']:has-text('Recommended')"),
-      page.locator("button:has-text('Sort by')"),
-      page.locator("[role='button']:has-text('Sort by')")
+      reviewRoot.locator("button:has-text('Recommended')"),
+      reviewRoot.locator("[role='button']:has-text('Recommended')"),
+      reviewRoot.locator("button:has-text('Sort by')"),
+      reviewRoot.locator("[role='button']:has-text('Sort by')")
     ];
     for (const trigger of sortTriggers) {
       if (await clickIfVisible(trigger)) break;
     }
     await page.waitForTimeout(400);
-    await clickIfVisible(page.getByText(/^Most recent$/i));
+    await clickIfVisible(reviewRoot.getByText(/^Most recent$/i));
   }
   await page.waitForTimeout(1_200);
-  await page.evaluate(() => {
-    for (const element of document.querySelectorAll('*')) {
+  await reviewRoot.evaluate(root => {
+    const preferred = root.querySelector("[data-scroll='true']");
+    if (preferred) {
+      preferred.scrollTop = 0;
+      preferred.dispatchEvent(new Event('scroll', { bubbles: true }));
+      return;
+    }
+    for (const element of root.querySelectorAll('*')) {
       const style = getComputedStyle(element);
-      const text = (element.innerText || '').slice(0, 2_000);
-      if (element.scrollHeight > element.clientHeight + 100
-        && /^(?:auto|scroll)$/.test(style.overflowY)
-        && /All reviews are from verified purchases|Most recent|Helpful/i.test(text)) {
+      if (element.scrollHeight > element.clientHeight + 4
+        && /^(?:auto|scroll|overlay)$/.test(style.overflowY)) {
         element.scrollTop = 0;
       }
     }
@@ -704,21 +890,27 @@ async function revealReviews(page, config) {
 }
 
 async function scrollReviewPanel(page) {
-  return page.evaluate(() => {
-    const candidates = [...document.querySelectorAll('*')].filter(element => {
+  const reviewDialog = await visibleReviewDialog(page);
+  const reviewRoot = reviewDialog ?? page.locator('body');
+  return reviewRoot.evaluate(root => {
+    const preferred = root.querySelector("[data-scroll='true']");
+    const candidates = [...root.querySelectorAll('*')].filter(element => {
       const style = getComputedStyle(element);
-      const text = (element.innerText || '').slice(0, 3_000);
-      return element.scrollHeight > element.clientHeight + 100
-        && /^(?:auto|scroll)$/.test(style.overflowY)
-        && /All reviews are from verified purchases|Most recent|Helpful/i.test(text);
+      return element.scrollHeight > element.clientHeight + 4
+        && /^(?:auto|scroll|overlay)$/.test(style.overflowY);
     });
-    const target = candidates.sort((a, b) => a.clientHeight - b.clientHeight)[0];
-    if (!target) return false;
+    const target = preferred && preferred.scrollHeight > preferred.clientHeight + 4
+      ? preferred
+      : candidates.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+    if (!target) return { moved: false, atEnd: true, scrollTop: 0, remaining: 0 };
     const before = target.scrollTop;
-    target.scrollTop = Math.min(target.scrollHeight, before + Math.max(400, Math.floor(target.clientHeight * 0.85)));
+    const distance = Math.max(300, Math.floor(target.clientHeight * 0.85));
+    target.scrollTop = Math.min(target.scrollHeight, before + distance);
     target.dispatchEvent(new Event('scroll', { bubbles: true }));
-    return target.scrollTop > before;
-  }).catch(() => false);
+    target.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: distance }));
+    const remaining = Math.max(0, target.scrollHeight - target.clientHeight - target.scrollTop);
+    return { moved: target.scrollTop > before, atEnd: remaining <= 4, scrollTop: target.scrollTop, remaining };
+  }).catch(() => ({ moved: false, atEnd: true, scrollTop: 0, remaining: 0 }));
 }
 
 async function detectProductPageProblem(page, expectedProductUrl = '') {
@@ -757,13 +949,12 @@ async function resolveTransientProductProblem(page, config, label, expectedProdu
   if (!problem || problem.permanent || config.browser.headless) return problem;
   const retryLimit = Math.max(1, Number(config.browser.manualRetryLimit ?? 8));
   for (let attempt = 1; attempt <= retryLimit && problem && !problem.permanent; attempt += 1) {
-    await promptEnter(`${label}${problem.message}\n请先确认当前Chrome已经能正常显示商品列表，再点击运营台“继续执行”（第 ${attempt}/${retryLimit} 次）：`);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await sleep(Math.max(1_500, config.browser.minimumDelayMs));
+    await promptEnter(`${label}${problem.message}\n请由运营人员在当前Chrome中处理网络、VPN、登录或验证；如需刷新或重新进入页面，也请人工操作。确认页面正常后再点击运营台“继续执行”（第 ${attempt}/${retryLimit} 次）。程序不会自动刷新或代替验证：`);
+    await sleep(1_000);
     await handleChallenge(page, config, label);
     problem = await detectProductPageProblem(page, expectedProductUrl);
     if (problem && !problem.permanent && attempt < retryLimit) {
-      console.log('重新加载后Temu仍提示网络异常，任务没有退出，将继续等待人工处理。');
+      console.log('运营确认后Temu仍提示异常；脚本没有刷新或点击页面，将继续等待运营人工处理。');
     }
   }
   return problem;
@@ -793,13 +984,21 @@ async function gatherReviews(page, config, productUrl, options = {}) {
   const sourceProductId = String(productUrl).match(/-g-(\d+)\.html/i)?.[1] ?? '';
   for (let round = 0; round < config.browser.maxReviewPages && staleRounds < 3; round += 1) {
     const cards = await extractReviewCards(page, config);
+    const viewportSignature = cards.map(card => `${card.domId}|${card.dateText}|${card.rawText}`).join('\n');
     const before = reviews.size;
     const newReviews = [];
     for (const card of cards) {
       const reviewDate = parseReviewDate(card.dateText || card.rawText);
       if (reviewDate && (!oldestSeen || reviewDate < oldestSeen)) oldestSeen = reviewDate;
       const reviewText = cleanTemuReviewText(card.reviewText || card.rawText);
-      const stableText = `${card.domId}|${reviewDate}|${card.ratingText}|${reviewText}|${card.variant ?? ''}`;
+      const stableText = [
+        card.domId,
+        reviewDate,
+        card.ratingText,
+        card.variant ?? '',
+        card.reviewerRegion ?? '',
+        card.rawText ?? reviewText
+      ].join('|');
       const externalReviewId = card.domId || crypto.createHash('sha256').update(stableText).digest('hex').slice(0, 24);
       if (reviews.has(externalReviewId)) continue;
       const review = {
@@ -819,7 +1018,7 @@ async function gatherReviews(page, config, productUrl, options = {}) {
       newReviews.push(review);
     }
     if (newReviews.length > 0 && options.onBatch) await options.onBatch(newReviews);
-    staleRounds = reviews.size === before ? staleRounds + 1 : 0;
+    const addedThisRound = reviews.size - before;
     if (options.onCheckpoint) {
       await options.onCheckpoint({
         pageIndex: round + 1,
@@ -828,10 +1027,31 @@ async function gatherReviews(page, config, productUrl, options = {}) {
         fullHistory: Boolean(options.fullHistory)
       });
     }
+    console.log(`评论扫描 ${round + 1}/${config.browser.maxReviewPages}：当前视图=${cards.length}，本轮新增=${addedThisRound}，累计=${reviews.size}，最早=${oldestSeen ?? '未知'}。`);
     if (!options.fullHistory && oldestSeen && oldestSeen < cutoff) break;
-    const clicked = await clickIfVisible(page.locator(config.selectors.reviewLoadMore));
-    const scrolled = clicked ? true : await scrollReviewPanel(page);
-    if (!scrolled) await page.mouse.wheel(0, 2200);
+    const reviewDialog = await visibleReviewDialog(page);
+    const reviewRoot = reviewDialog ?? page.locator('body');
+    const clicked = await clickIfVisible(reviewRoot.locator(config.selectors.reviewLoadMore));
+    const scrollResult = clicked
+      ? { moved: true, atEnd: false, scrollTop: null, remaining: null }
+      : await scrollReviewPanel(page);
+    if (!scrollResult.moved && !reviewDialog) await page.mouse.wheel(0, 2200);
+    const waitLimit = scrollResult.remaining != null && scrollResult.remaining > 1_200 ? 1 : 6;
+    for (let waitAttempt = 0; waitAttempt < waitLimit; waitAttempt += 1) {
+      await page.waitForTimeout(500);
+      const nextCards = await extractReviewCards(page, config);
+      const nextSignature = nextCards.map(card => `${card.domId}|${card.dateText}|${card.rawText}`).join('\n');
+      if (nextSignature !== viewportSignature) break;
+    }
+    staleRounds = addedThisRound > 0 || clicked || (scrollResult.moved && !scrollResult.atEnd)
+      ? 0
+      : staleRounds + 1;
+    if (scrollResult.scrollTop != null) {
+      console.log(`评论滚动：位置=${scrollResult.scrollTop}px，剩余=${scrollResult.remaining}px，连续到底无新增=${staleRounds}/3。`);
+    }
+    await handleChallenge(page, config, '评论加载');
+    const pageProblem = await resolveTransientProductProblem(page, config, '评论加载：', productUrl);
+    if (pageProblem) throw new Error(pageProblem.message);
     await humanDelay(config);
   }
   return [...reviews.values()];
@@ -960,7 +1180,7 @@ export async function captureCurrentCatalog(config, db) {
   const summary = { runId, active: 0, added: 0, retained: 0, archived: 0 };
   try {
     session = await openExistingOperatorContext(config);
-    const page = await findCurrentOperatorTemuPage(session.context);
+    const page = await findCurrentOperatorTemuPage(session.context, { pageType: 'catalog', config, job });
     if (!page) {
       throw new Error('采集 Chrome 中没有 Temu 页面。请人工打开 Temu 摩托配件商品列表并选择 Top Sales。');
     }
@@ -1007,7 +1227,7 @@ export async function captureCurrentProductReviews(config, db) {
   let started = false;
   try {
     session = await openExistingOperatorContext(config);
-    const page = await findCurrentOperatorTemuPage(session.context);
+    const page = await findCurrentOperatorTemuPage(session.context, { pageType: 'product' });
     if (!page) throw new Error('采集 Chrome 中没有 Temu 页面。请先从 Top Sales 列表手动打开一个商品详情页。');
 
     const currentUrl = canonicalProductUrl(page.url());
@@ -1026,9 +1246,14 @@ export async function captureCurrentProductReviews(config, db) {
     await handleChallenge(page, config, '当前商品评论');
     const problem = await detectProductPageProblem(page, product.productUrl);
     if (problem?.permanent) {
-      const resultCode = problem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
-      markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
-        new Error(`SKIPPED: ${problem.message}`), resultCode);
+      const resultCode = problem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
+      setProductAvailability(db, product.id, resultCode, problem.message);
+      const skipError = new Error(`SKIPPED: ${problem.message}`);
+      if (resultCode === 'session_unavailable') {
+        markReviewCrawlDeferred(db, product.id, product.storedReviewCount, skipError, resultCode);
+      } else {
+        markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount, skipError, resultCode);
+      }
       finishRun(db, runId, 'completed');
       console.log(`当前商品未采集评论：${problem.message}`);
       return { runId, productId: product.id, listingRank: product.listingRank, title: product.title,
@@ -1038,6 +1263,7 @@ export async function captureCurrentProductReviews(config, db) {
 
     const enriched = await extractStructuredProduct(page, product);
     const productId = upsertProduct(db, enriched, runId);
+    setProductAvailability(db, productId, 'available');
     const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
       && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
     const reviews = await gatherReviews(page, config, product.productUrl, {
@@ -1117,6 +1343,7 @@ export async function crawl(config, db) {
           await sleep(config.browser.minimumDelayMs);
           const enriched = await extractStructuredProduct(detailPage, product);
           const productId = upsertProduct(db, enriched, runId);
+          setProductAvailability(db, productId, 'available');
           const reviews = await gatherReviews(detailPage, config, product.productUrl);
           upsertReviews(db, productId, reviews);
           updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
@@ -1145,12 +1372,15 @@ export async function crawl(config, db) {
 
 export async function crawlReviews(config, db, options = {}) {
   const batchSize = Math.max(1, Number(options.batchSize ?? 10));
+  const reviewMode = options.reviewMode === 'deep' ? 'deep' : 'quick';
   const candidates = listReviewCrawlCandidates(db, {
     limit: batchSize,
     retryFailed: Boolean(options.retryFailed),
-    includeReviewed: Boolean(options.includeReviewed)
+    includeReviewed: Boolean(options.includeReviewed),
+    selectedOnly: Boolean(options.selectedOnly),
+    includeQuickCompleted: reviewMode === 'deep'
   });
-  const runConfig = { ...config, mode: 'reviews-only', reviewBatch: { ...options, batchSize } };
+  const runConfig = { ...config, mode: `reviews-${reviewMode}`, reviewBatch: { ...options, batchSize, reviewMode } };
   const runId = startRun(db, runConfig);
   let session;
   let completed = 0;
@@ -1158,6 +1388,9 @@ export async function crawlReviews(config, db, options = {}) {
   let skipped = 0;
   let failed = 0;
   let reviewsSeen = 0;
+  let consecutiveSessionUnavailable = 0;
+  const sessionUnavailableLimit = Math.max(1,
+    Number(config.reviewAnalysis?.maximumConsecutiveSessionUnavailable ?? 2));
   try {
     if (candidates.length === 0) {
       finishRun(db, runId, 'completed');
@@ -1166,44 +1399,76 @@ export async function crawlReviews(config, db, options = {}) {
     session = await openContext(config);
     const detailPage = session.context.pages().find(page => !page.isClosed()) ?? await session.context.newPage();
     let operatorConfirmed = false;
-    console.log(`本批仅抓评论：商品=${candidates.length}，失败重试=${options.retryFailed ? '是' : '否'}。`);
+    console.log(`批量评论模式=${reviewMode === 'deep' ? '深度分析' : '近30天轻采集'}，商品=${candidates.length}，仅候选=${options.selectedOnly ? '是' : '否'}，失败重试=${options.retryFailed ? '是' : '否'}。`);
     for (const [index, product] of candidates.entries()) {
       markReviewCrawlStarted(db, product.id, runId);
       try {
+        console.log(`批量进度 ${index + 1}/${candidates.length}：Top Sales #${product.listingRank ?? '-'} ${product.title.slice(0, 70)}`);
         if (detailPage.isClosed()) throw new Error('Target page, context or browser has been closed');
         await navigateTemu(detailPage, product.productUrl);
+        await logProductNavigation(detailPage, product, '直接访问后');
         await handleChallenge(detailPage, config, `评论商品 ${index + 1}/${candidates.length}`);
         await sleep(config.browser.minimumDelayMs);
+        await logProductNavigation(detailPage, product, '验证/等待后');
         let pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
-          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
-          markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
-            new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
+          const resultCode = pageProblem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
+          setProductAvailability(db, product.id, resultCode, pageProblem.message);
+          const skipError = new Error(`SKIPPED: ${pageProblem.message}`);
+          if (resultCode === 'session_unavailable') {
+            markReviewCrawlDeferred(db, product.id, product.storedReviewCount, skipError, resultCode);
+            consecutiveSessionUnavailable += 1;
+          } else {
+            markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount, skipError, resultCode);
+            consecutiveSessionUnavailable = 0;
+          }
           skipped += 1;
           console.log(`评论跳过 ${completed + skipped + failed}/${candidates.length}：${pageProblem.message} ${product.title.slice(0, 42)}`);
+          if (consecutiveSessionUnavailable >= sessionUnavailableLimit) {
+            console.error(`连续 ${consecutiveSessionUnavailable} 个商品在当前会话显示不可售，本批已停止；后续商品仍保持待处理。请恢复 Temu 商品详情后再继续。`);
+            break;
+          }
           continue;
         }
-        if (pageProblem) throw new Error(pageProblem.message);
+        if (pageProblem) {
+          consecutiveSessionUnavailable = 0;
+          throw new Error(pageProblem.message);
+        }
         if (!operatorConfirmed && !config.browser.headless && config.browser.pauseBeforeStart) {
-          await promptEnter('评论抓取已暂停。请在当前Chrome中完成登录、验证码或安全验证，并确认商品详情和评价区域正常显示；完成后回到本窗口按 Enter 开始：');
+          await promptEnter('评论抓取已暂停。请由运营人员在当前Chrome中人工完成登录、验证码或安全验证，并确认商品详情和评价区域正常显示；完成后回到本窗口按 Enter 开始。程序不会点击、刷新或绕过验证：');
           operatorConfirmed = true;
           await handleChallenge(detailPage, config, '评论抓取开始前');
         }
         pageProblem = await resolveTransientProductProblem(detailPage, config, `评论商品 ${index + 1}/${candidates.length}：`, product.productUrl);
         if (pageProblem?.permanent) {
-          const resultCode = pageProblem.code === 'sold_out' ? 'sold_out' : 'invalid_link';
-          markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount,
-            new Error(`SKIPPED: ${pageProblem.message}`), resultCode);
+          const resultCode = pageProblem.code === 'sold_out' ? 'session_unavailable' : 'invalid_link';
+          setProductAvailability(db, product.id, resultCode, pageProblem.message);
+          const skipError = new Error(`SKIPPED: ${pageProblem.message}`);
+          if (resultCode === 'session_unavailable') {
+            markReviewCrawlDeferred(db, product.id, product.storedReviewCount, skipError, resultCode);
+            consecutiveSessionUnavailable += 1;
+          } else {
+            markReviewCrawlFinished(db, product.id, 'completed', product.storedReviewCount, skipError, resultCode);
+            consecutiveSessionUnavailable = 0;
+          }
           skipped += 1;
           console.log(`评论跳过 ${completed + skipped + failed}/${candidates.length}：${pageProblem.message} ${product.title.slice(0, 42)}`);
+          if (consecutiveSessionUnavailable >= sessionUnavailableLimit) {
+            console.error(`连续 ${consecutiveSessionUnavailable} 个商品在当前会话显示不可售，本批已停止；后续商品仍保持待处理。请恢复 Temu 商品详情后再继续。`);
+            break;
+          }
           continue;
         }
-        if (pageProblem) throw new Error(pageProblem.message);
+        if (pageProblem) {
+          consecutiveSessionUnavailable = 0;
+          throw new Error(pageProblem.message);
+        }
+        consecutiveSessionUnavailable = 0;
         const configuredSortOrder = config.jobs.find(job => job.subcategory === product.subcategory)?.sortOrder ?? product.sortOrder;
         const enriched = await extractStructuredProduct(detailPage, { ...product, sortOrder: configuredSortOrder });
         const productId = upsertProduct(db, enriched, runId);
-        const fullHistory = Boolean(config.reviewAnalysis?.pilotFullHistory)
-          && Number(product.listingRank ?? 2147483647) <= Number(config.reviewAnalysis?.pilotBatchSize ?? 10);
+        setProductAvailability(db, productId, 'available');
+        const fullHistory = reviewMode === 'deep';
         const reviews = await gatherReviews(detailPage, config, product.productUrl, {
           fullHistory,
           onBatch: batch => upsertReviews(db, productId, batch),
@@ -1215,8 +1480,10 @@ export async function crawlReviews(config, db, options = {}) {
           throw new Error(`页面显示有 ${enriched.totalReviewCount} 条评价，但当前选择器未提取到评论。`);
         }
         updateProductAnalysis(db, productId, computeAnalysis(db, productId, enriched, config));
-        markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null,
-          storedReviewCount === 0 ? 'no_reviews' : 'completed');
+        const completedCode = reviewMode === 'deep'
+          ? (storedReviewCount === 0 ? 'deep_no_reviews' : 'deep_completed')
+          : (storedReviewCount === 0 ? 'no_reviews' : 'completed');
+        markReviewCrawlFinished(db, productId, 'completed', storedReviewCount, null, completedCode);
         completed += 1;
         if (storedReviewCount > 0) reviewDataSuccess += 1;
         reviewsSeen += reviews.length;
@@ -1234,7 +1501,7 @@ export async function crawlReviews(config, db, options = {}) {
           break;
         }
       } finally {
-        await sleep(config.browser.minimumDelayMs);
+        await humanDelay(config);
       }
     }
     const attempted = completed + skipped + failed;

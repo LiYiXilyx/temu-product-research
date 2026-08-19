@@ -5,6 +5,7 @@ import {
   getActiveProductByUrl,
   getReviewsForProduct,
   listReviewCrawlCandidates,
+  markReviewCrawlDeferred,
   markReviewCrawlFinished,
   markReviewCrawlStarted,
   openDatabase,
@@ -12,6 +13,7 @@ import {
   reportProducts,
   reportReviewIssueEvidence,
   replaceReviewIssueEvidence,
+  setProductAvailability,
   startRun,
   upsertProduct,
   upsertReviews
@@ -77,6 +79,52 @@ test('review batches skip products that already have imported reviews by default
   upsertReviews(db, productId, [{ externalReviewId: 'existing', reviewDate: '2026-08-17', rating: 5, reviewText: 'ok', sourceUrl: product.productUrl }]);
   assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 0);
   assert.equal(listReviewCrawlCandidates(db, { limit: 10, includeReviewed: true })[0].id, productId);
+  db.close();
+});
+
+test('deep review batches only return products marked as selected', () => {
+  const db = openDatabase(':memory:');
+  const runId = startRun(db, { test: true });
+  const base = {
+    siteCountry: '德国', currency: 'EUR', primaryCategory: 'Automotive',
+    subcategory: 'Motorcycles & Powersports Accessories', sortOrder: 'Top Sales',
+    imageUrl: '', priceEur: 10, salesCount: 100, rating: 4.7, totalReviewCount: 20, raw: {}
+  };
+  const selectedId = upsertProduct(db, { ...base, productUrl: 'https://www.temu.com/de-en/selected-g-31.html', title: 'Selected' }, runId);
+  upsertProduct(db, { ...base, productUrl: 'https://www.temu.com/de-en/unselected-g-32.html', title: 'Unselected' }, runId);
+  db.prepare('UPDATE products SET selected=1 WHERE id=?').run(selectedId);
+
+  assert.deepEqual(listReviewCrawlCandidates(db, { limit: 10, selectedOnly: true }).map(row => row.id), [selectedId]);
+  markReviewCrawlStarted(db, selectedId, runId);
+  markReviewCrawlFinished(db, selectedId, 'completed', 12, null, 'completed');
+  assert.deepEqual(listReviewCrawlCandidates(db, {
+    limit: 10, selectedOnly: true, includeReviewed: true, includeQuickCompleted: true
+  }).map(row => row.id), [selectedId]);
+  markReviewCrawlStarted(db, selectedId, runId);
+  markReviewCrawlFinished(db, selectedId, 'completed', 30, null, 'deep_completed');
+  assert.equal(listReviewCrawlCandidates(db, {
+    limit: 10, selectedOnly: true, includeReviewed: true, includeQuickCompleted: true
+  }).length, 0);
+  db.close();
+});
+
+test('session-unavailable products leave the review queue until a fresh catalog finds them again', () => {
+  const db = openDatabase(':memory:');
+  const runId = startRun(db, { test: true });
+  const product = {
+    productUrl: 'https://www.temu.com/de-en/available-g-41.html', siteCountry: '德国', currency: 'EUR',
+    primaryCategory: 'Automotive', subcategory: 'Motorcycles & Powersports Accessories', sortOrder: 'Top Sales',
+    title: 'Availability test', imageUrl: '', priceEur: 12, salesCount: 99, rating: 4.8, totalReviewCount: 8, raw: {}
+  };
+  const productId = upsertProduct(db, product, runId);
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 1);
+  markReviewCrawlStarted(db, productId, runId);
+  setProductAvailability(db, productId, 'session_unavailable', 'Collector session shows unavailable');
+  markReviewCrawlDeferred(db, productId, 0, new Error('temporary collector state'));
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 }).length, 0);
+  assert.equal(getReviewCrawlSummary(db).pending, 1);
+  setProductAvailability(db, productId, 'available');
+  assert.equal(listReviewCrawlCandidates(db, { limit: 10 })[0].id, productId);
   db.close();
 });
 

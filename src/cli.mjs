@@ -6,16 +6,22 @@ import { openDatabase } from './database.mjs';
 import { seedDemo } from './demo.mjs';
 
 function parseArgs(argv) {
-  const result = { command: argv[2] ?? 'help', config: 'config.json', batchSize: 10, retryFailed: false, includeReviewed: false };
+  const result = {
+    command: argv[2] ?? 'help', config: 'config.json', batchSize: 10,
+    retryFailed: false, includeReviewed: false, selectedOnly: false, reviewMode: 'quick'
+  };
   for (let index = 3; index < argv.length; index += 1) {
     if (argv[index] === '--config') result.config = argv[++index];
     else if (argv[index] === '--batch-size') result.batchSize = Number(argv[++index]);
     else if (argv[index] === '--retry-failed') result.retryFailed = true;
     else if (argv[index] === '--include-reviewed') result.includeReviewed = true;
+    else if (argv[index] === '--selected-only') result.selectedOnly = true;
+    else if (argv[index] === '--review-mode') result.reviewMode = String(argv[++index] ?? '');
   }
   if (!Number.isInteger(result.batchSize) || result.batchSize < 1 || result.batchSize > 100) {
     throw new Error('--batch-size 必须是1到100之间的整数。');
   }
+  if (!['quick', 'deep'].includes(result.reviewMode)) throw new Error('--review-mode 必须是 quick 或 deep。');
   return result;
 }
 
@@ -23,7 +29,7 @@ async function main() {
   const args = parseArgs(process.argv);
   if (args.command === 'help') {
     console.log('用法：node src/cli.mjs <init|capture|current-review|refresh|crawl|reviews|demo> --config config.json');
-    console.log('评论批次：node src/cli.mjs reviews --config config.json --batch-size 10 [--retry-failed] [--include-reviewed]');
+    console.log('评论批次：node src/cli.mjs reviews --config config.json --batch-size 10 --review-mode quick|deep [--selected-only] [--retry-failed] [--include-reviewed]');
     return;
   }
   if (args.command === 'init') {

@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS products (
   selected INTEGER NOT NULL DEFAULT 0,
   selection_reasons TEXT,
   catalog_active INTEGER NOT NULL DEFAULT 1,
+  availability_status TEXT NOT NULL DEFAULT 'unknown',
+  availability_checked_at TEXT,
+  availability_message TEXT,
   listing_rank INTEGER,
   source_run_id INTEGER,
   first_seen_at TEXT NOT NULL,
@@ -118,6 +121,8 @@ CREATE INDEX IF NOT EXISTS idx_review_issue_product ON review_issue_evidence(pro
 export function openDatabase(databasePath) {
   if (databasePath !== ':memory:') fs.mkdirSync(path.dirname(databasePath), { recursive: true });
   const db = new DatabaseSync(databasePath);
+  db.exec('PRAGMA busy_timeout=5000;');
+  if (databasePath !== ':memory:') db.exec('PRAGMA journal_mode=WAL;');
   db.exec(SCHEMA);
   ensureColumns(db, 'products', {
     catalog_active: 'INTEGER NOT NULL DEFAULT 1',
@@ -127,7 +132,10 @@ export function openDatabase(databasePath) {
     review_growth_signal: 'TEXT',
     fast_growing: 'INTEGER NOT NULL DEFAULT 0',
     listing_date_range_start: 'TEXT',
-    listing_date_range_end: 'TEXT'
+    listing_date_range_end: 'TEXT',
+    availability_status: "TEXT NOT NULL DEFAULT 'unknown'",
+    availability_checked_at: 'TEXT',
+    availability_message: 'TEXT'
   });
   ensureColumns(db, 'reviews', {
     variant: 'TEXT', reviewer_region: 'TEXT',
@@ -139,9 +147,42 @@ export function openDatabase(databasePath) {
     result_code: 'TEXT', checkpoint_page_index: 'INTEGER NOT NULL DEFAULT 0',
     checkpoint_oldest_date: 'TEXT', checkpoint_review_count: 'INTEGER NOT NULL DEFAULT 0', checkpoint_json: 'TEXT'
   });
+  backfillAvailabilityFromReviewState(db);
   db.exec('CREATE INDEX IF NOT EXISTS idx_products_catalog_active ON products(catalog_active, site_country, primary_category, subcategory)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_products_availability ON products(catalog_active, availability_status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_reviews_content_fingerprint ON reviews(product_id, content_fingerprint)');
   return db;
+}
+
+function backfillAvailabilityFromReviewState(db) {
+  db.exec(`
+    -- A collector-side "sold out" page can be caused by this browser session's
+    -- country, account or cookie context. Keep historical observations scoped
+    -- to the collection session rather than declaring a product globally sold out.
+    UPDATE review_crawl_state
+    SET result_code='session_unavailable'
+    WHERE result_code='sold_out';
+
+    UPDATE products
+    SET
+      availability_status='session_unavailable',
+      availability_message=COALESCE(availability_message,'当前采集会话显示不可售，待正常会话或刷新商品池复核')
+    WHERE availability_status='sold_out';
+
+    UPDATE products
+    SET
+      availability_status=CASE
+        WHEN (SELECT result_code FROM review_crawl_state WHERE product_id=products.id)='session_unavailable' THEN 'session_unavailable'
+        ELSE 'invalid_link'
+      END,
+      availability_checked_at=(SELECT last_finished_at FROM review_crawl_state WHERE product_id=products.id),
+      availability_message='从已有评论抓取结果回填'
+    WHERE COALESCE(availability_status,'unknown')='unknown'
+      AND id IN (
+        SELECT product_id FROM review_crawl_state
+        WHERE result_code IN ('session_unavailable','invalid_link')
+      )
+  `);
 }
 
 function ensureColumns(db, tableName, definitions) {
@@ -185,6 +226,13 @@ export function upsertProduct(db, product, runId) {
   return Number(db.prepare('SELECT id FROM products WHERE product_url=?').get(product.productUrl).id);
 }
 
+export function setProductAvailability(db, productId, status, message = null) {
+  const valid = new Set(['available', 'session_unavailable', 'invalid_link', 'restricted', 'unknown']);
+  if (!valid.has(status)) throw new Error(`无效商品可用性状态：${status}`);
+  db.prepare(`UPDATE products SET availability_status=?,availability_checked_at=?,availability_message=? WHERE id=?`)
+    .run(status, new Date().toISOString(), message ? String(message) : null, productId);
+}
+
 export function replaceActiveCatalog(db, scope, products, runId) {
   const previousRows = db.prepare(`SELECT id,product_url AS productUrl FROM products
     WHERE catalog_active=1 AND site_country=? AND primary_category=? AND subcategory=?`)
@@ -206,6 +254,7 @@ export function replaceActiveCatalog(db, scope, products, runId) {
         catalogActive: true,
         listingRank: index + 1
       }, runId);
+      setProductAvailability(db, productId, 'available');
       activeIds.push(productId);
       if (previousIds.has(productId)) retained += 1;
       else added += 1;
@@ -258,8 +307,17 @@ export function upsertReviews(db, productId, reviews) {
     for (const review of reviews) {
       const reviewText = String(review.reviewText ?? '').trim();
       const variant = String(review.variant ?? '').trim();
+      const reviewerRegion = String(review.reviewerRegion ?? '').trim();
+      const rawReviewText = String(review.raw?.rawText ?? reviewText).trim();
       const fingerprint = review.contentFingerprint || crypto.createHash('sha256')
-        .update([review.reviewDate ?? '', review.rating ?? '', reviewText.toLowerCase(), variant.toLowerCase()].join('|'))
+        .update([
+          review.reviewDate ?? '',
+          review.rating ?? '',
+          reviewText.toLowerCase(),
+          variant.toLowerCase(),
+          reviewerRegion.toLowerCase(),
+          rawReviewText.toLowerCase()
+        ].join('|'))
         .digest('hex').slice(0, 32);
       const isDuplicate = review.isDuplicate ?? Boolean(duplicateLookup.get(productId, fingerprint, review.externalReviewId));
       const hasText = review.hasText ?? Boolean(reviewText);
@@ -269,7 +327,7 @@ export function upsertReviews(db, productId, reviews) {
         ? '字段不完整' : isDuplicate ? '疑似重复' : hasText ? '可用于分析' : '无正文');
       statement.run(
         productId, review.externalReviewId, review.reviewDate, review.rating, reviewText, variant,
-        String(review.reviewerRegion ?? ''), review.isTranslated ? 1 : 0, isDuplicate ? 1 : 0,
+        reviewerRegion, review.isTranslated ? 1 : 0, isDuplicate ? 1 : 0,
         hasText ? 1 : 0, hasImage ? 1 : 0, JSON.stringify(imageUrls), quality,
         String(review.sourceProductId ?? ''), fingerprint, review.sourceUrl,
         new Date().toISOString(), JSON.stringify(review.raw ?? {})
@@ -345,6 +403,8 @@ export function listReviewCrawlCandidates(db, options = {}) {
   const limit = Math.max(1, Number(options.limit ?? 10));
   const retryFailed = options.retryFailed ? 1 : 0;
   const includeReviewed = options.includeReviewed ? 1 : 0;
+  const selectedOnly = options.selectedOnly ? 1 : 0;
+  const includeQuickCompleted = options.includeQuickCompleted ? 1 : 0;
   return db.prepare(`
     SELECT
       p.id,p.product_url AS productUrl,p.site_country AS siteCountry,p.currency,
@@ -352,6 +412,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       p.listing_rank AS listingRank,
       p.title,p.image_url AS imageUrl,p.price_eur AS priceEur,p.sales_count AS salesCount,
       p.rating,p.total_review_count AS totalReviewCount,p.raw_json AS rawJson,
+      COALESCE(p.availability_status,'unknown') AS availabilityStatus,
       COALESCE(s.status,'pending') AS crawlStatus,COALESCE(s.attempt_count,0) AS attemptCount,
       COALESCE(s.checkpoint_page_index,0) AS checkpointPageIndex,
       s.checkpoint_oldest_date AS checkpointOldestDate,
@@ -362,8 +423,11 @@ export function listReviewCrawlCandidates(db, options = {}) {
       AND p.product_url NOT LIKE '%goods_id=demo%'
       AND p.subcategory <> 'Demo'
       AND p.catalog_active=1
+      AND COALESCE(p.availability_status,'unknown') NOT IN ('session_unavailable','invalid_link')
+      AND (?=0 OR p.selected=1)
       AND (
         s.status IS NULL OR s.status IN ('pending','in_progress') OR (?=1 AND s.status='failed')
+        OR (?=1 AND s.status='completed' AND COALESCE(s.result_code,'completed') IN ('completed','no_reviews'))
       )
       AND (
         ?=1 OR s.product_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM reviews existing WHERE existing.product_id=p.id)
@@ -372,7 +436,7 @@ export function listReviewCrawlCandidates(db, options = {}) {
       CASE COALESCE(s.status,'pending') WHEN 'in_progress' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
       COALESCE(p.listing_rank,2147483647),COALESCE(p.sales_count,0) DESC,p.id
     LIMIT ?
-  `).all(retryFailed, includeReviewed, limit).map(row => {
+  `).all(selectedOnly, retryFailed, includeQuickCompleted, includeReviewed, limit).map(row => {
     let raw = {};
     try { raw = JSON.parse(row.rawJson || '{}'); } catch {}
     return { ...row, raw };
@@ -387,6 +451,7 @@ export function getActiveProductByUrl(db, productUrl) {
       p.primary_category AS primaryCategory,p.subcategory,p.sort_order AS sortOrder,
       p.listing_rank AS listingRank,p.title,p.image_url AS imageUrl,p.price_eur AS priceEur,
       p.sales_count AS salesCount,p.rating,p.total_review_count AS totalReviewCount,p.raw_json AS rawJson,
+      COALESCE(p.availability_status,'unknown') AS availabilityStatus,
       (SELECT COUNT(*) FROM reviews r WHERE r.product_id=p.id) AS storedReviewCount
     FROM products p
     WHERE p.catalog_active=1 AND p.subcategory<>'Demo' AND p.product_url NOT LIKE '%goods_id=demo%'
@@ -428,6 +493,14 @@ export function markReviewCrawlFinished(db, productId, status, reviewCount = 0, 
       status=?,last_finished_at=?,last_review_count=?,result_code=?,last_error=? WHERE product_id=?`)
     .run(status, new Date().toISOString(), Number(reviewCount ?? 0),
       resultCode ?? (status === 'completed' ? 'completed' : 'unknown_error'),
+      error?.stack ?? (error ? String(error) : null), productId);
+}
+
+export function markReviewCrawlDeferred(db, productId, reviewCount = 0, error = null,
+  resultCode = 'session_unavailable') {
+  db.prepare(`UPDATE review_crawl_state SET
+      status='pending',last_finished_at=?,last_review_count=?,result_code=?,last_error=? WHERE product_id=?`)
+    .run(new Date().toISOString(), Number(reviewCount ?? 0), resultCode,
       error?.stack ?? (error ? String(error) : null), productId);
 }
 

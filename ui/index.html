@@ -42,6 +42,11 @@
         <small>网络或页面异常</small>
       </article>
       <article class="metric">
+        <span class="metric-label">当前会话不可售</span>
+        <strong id="unavailable">—</strong>
+        <small>采集会话异常或链接失效，待复核</small>
+      </article>
+      <article class="metric">
         <span class="metric-label">评论已入库</span>
         <strong id="reviews">—</strong>
         <small>可追溯明细</small>
@@ -56,6 +61,17 @@
             <h2>选择要执行的任务</h2>
           </div>
           <span id="lastRefresh" class="subtle">商品池尚未刷新</span>
+        </div>
+
+        <div class="batch-options">
+          <label for="batchSize">每批商品数</label>
+          <select id="batchSize">
+            <option value="10" selected>10 个（推荐）</option>
+            <option value="20">20 个</option>
+            <option value="30">30 个</option>
+            <option value="50">50 个</option>
+          </select>
+          <span>批次完成后自动更新数据库和运营 Excel</span>
         </div>
 
         <div class="action-grid">
@@ -76,12 +92,21 @@
           </article>
           <article class="action-card">
             <span class="step-number">03</span>
-            <h3>继续下一个商品</h3>
-            <p>当前页完成后，返回 Top Sales 列表手动打开下一个商品，再重复点击采集；重复运行会自动去重。</p>
-            <button data-task="current-review">采集下一个当前页</button>
+            <h3>批量轻采集评论</h3>
+            <p>面向大商品池，程序按 Top Sales 顺序自动逐个进入商品，只采集近30天评论正文和7/30/90天活跃度。</p>
+            <div class="action-buttons">
+              <button data-task="reviews-light" class="primary-button">抓取下一批</button>
+              <button data-task="retry">重试失败</button>
+            </div>
           </article>
           <article class="action-card">
             <span class="step-number">04</span>
+            <h3>候选商品深度评论</h3>
+            <p>只处理数据库中已标记为候选的商品，深入采集历史评论和1–3星差评，用于主题占比与原评论溯源。</p>
+            <button data-task="reviews-deep">深抓候选商品</button>
+          </article>
+          <article class="action-card">
+            <span class="step-number">05</span>
             <h3>更新运营 Excel</h3>
             <p>不访问 Temu，可重新生成完整报表；测试前也可只清空 Excel，数据库不会删除。</p>
             <div class="action-buttons">
@@ -102,10 +127,16 @@
         </div>
         <div class="progress-track"><span id="progressBar"></span></div>
         <p id="taskStep" class="task-step">请选择左侧操作开始</p>
+        <p id="currentProduct" class="current-product" hidden></p>
+
+        <div class="runtime-actions">
+          <button id="pauseButton" class="pause-button" hidden>暂停批次</button>
+          <button id="resumeButton" class="continue-button" hidden>继续批次</button>
+        </div>
 
         <div id="manualGate" class="manual-gate" hidden>
           <strong>需要你在采集 Chrome 中处理</strong>
-          <p>确认当前页面已正常显示商品详情和评论。若仍有登录、验证或网络错误，请处理完再继续；程序不会绕过验证。</p>
+          <p>请由运营人员处理登录、验证码、安全验证、网络/VPN，并在需要时人工刷新页面。确认页面正常后再继续；程序不会点击、刷新或绕过验证。</p>
           <button id="continueButton" class="continue-button">当前页已正常，继续执行</button>
         </div>
 
