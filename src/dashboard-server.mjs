@@ -222,6 +222,7 @@ function databaseSummary() {
   }
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
+    db.exec('PRAGMA busy_timeout=3000;');
     const productRow = db.prepare(`SELECT COUNT(*) AS count FROM products
       WHERE catalog_active=1 AND product_url NOT LIKE '%goods_id=demo%' AND subcategory<>'Demo'`).get();
     const reviewRow = db.prepare(`SELECT COUNT(*) AS count FROM reviews r JOIN products p ON p.id=r.product_id
@@ -266,23 +267,62 @@ async function readJsonBody(request) {
   return body ? JSON.parse(body) : {};
 }
 
-function openWithDefaultApp(target) {
-  if (!fs.existsSync(target)) throw new Error('文件尚未生成。');
+async function openWithDefaultApp(target) {
+  if (!fs.existsSync(target)) throw new Error(`目标不存在：${target}`);
+  const targetStat = await fsp.stat(target);
+  const powershellCommand = [
+    "$ErrorActionPreference = 'Stop'",
+    'try {',
+    '  $target = $env:TEMU_OPERATOR_OPEN_TARGET',
+    "  if ([string]::IsNullOrWhiteSpace($target)) { throw '未收到要打开的文件路径。' }",
+    "  if (-not (Test-Path -LiteralPath $target)) { throw ('目标不存在：' + $target) }",
+    targetStat.isDirectory()
+      ? "  Start-Process -FilePath 'explorer.exe' -ArgumentList @($target) -ErrorAction Stop"
+      : '  Start-Process -FilePath $target -ErrorAction Stop',
+    '} catch {',
+    '  [Console]::Error.WriteLine($_.Exception.Message)',
+    '  exit 1',
+    '}'
+  ].join('; ');
+
   return new Promise((resolve, reject) => {
     const child = spawn('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
-      '-Command', 'Start-Process -FilePath $env:TEMU_OPERATOR_OPEN_TARGET'
+      '-Command', powershellCommand
     ], {
-      detached: true,
-      stdio: 'ignore',
+      detached: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       env: { ...process.env, TEMU_OPERATOR_OPEN_TARGET: target }
     });
-    child.once('spawn', () => {
-      child.unref();
-      resolve();
+    let stdout = '';
+    let stderr = '';
+    let finished = false;
+    const timeout = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      child.kill();
+      reject(new Error(`打开命令等待超时：${target}`));
+    }, 15_000);
+    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    child.once('error', error => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      reject(new Error(`无法启动 Windows 打开命令：${error.message}`));
     });
-    child.once('error', reject);
+    child.once('close', code => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      if (code === 0) {
+        resolve({ target, isDirectory: targetStat.isDirectory() });
+        return;
+      }
+      const detail = stderr.trim() || stdout.trim() || `PowerShell 退出码 ${code}`;
+      reject(new Error(`Windows 无法打开目标：${detail}`));
+    });
   });
 }
 
@@ -357,12 +397,12 @@ const server = http.createServer(async (request, response) => {
       const target = latestExcelPath();
       if (!target) throw new Error('运营 Excel 尚未生成。');
       await openWithDefaultApp(target);
-      json(response, 200, { ok: true, message: '已发送打开运营 Excel 请求。' });
+      json(response, 200, { ok: true, message: 'Windows 已成功执行打开运营 Excel 命令。' });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/open/folder') {
       await openWithDefaultApp(outputDir);
-      json(response, 200, { ok: true, message: '已发送打开结果文件夹请求。' });
+      json(response, 200, { ok: true, message: 'Windows 已成功执行打开结果文件夹命令。' });
       return;
     }
     if (request.method === 'GET') {

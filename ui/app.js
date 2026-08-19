@@ -37,11 +37,11 @@ function dateTime(value) {
   return `最近采集：${new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value))}`;
 }
 
-function showToast(message) {
+function showToast(message, duration = 2600) {
   elements.toast.textContent = message;
   elements.toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => elements.toast.classList.remove('show'), 2600);
+  toastTimer = setTimeout(() => elements.toast.classList.remove('show'), duration);
 }
 
 async function api(path, options = {}) {
@@ -175,14 +175,14 @@ elements.openExcel.addEventListener('click', async () => {
     const result = await api('/api/open/excel', { method: 'POST' });
     showToast(result.message || '正在打开运营 Excel…');
   }
-  catch (error) { showToast(error.message); }
+  catch (error) { showToast(error.message, 8000); }
 });
 elements.openFolder.addEventListener('click', async () => {
   try {
     const result = await api('/api/open/folder', { method: 'POST' });
     showToast(result.message || '正在打开结果文件夹…');
   }
-  catch (error) { showToast(error.message); }
+  catch (error) { showToast(error.message, 8000); }
 });
 elements.clearExcel.addEventListener('click', async () => {
   const confirmed = window.confirm('确认清除运营 Excel 中的商品、主图和评论内容吗？\n\n数据库不会删除，之后点击“重新导出”即可恢复。');

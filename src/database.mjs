@@ -118,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_review_issue_product ON review_issue_evidence(pro
 export function openDatabase(databasePath) {
   if (databasePath !== ':memory:') fs.mkdirSync(path.dirname(databasePath), { recursive: true });
   const db = new DatabaseSync(databasePath);
+  db.exec('PRAGMA busy_timeout=5000;');
+  if (databasePath !== ':memory:') db.exec('PRAGMA journal_mode=WAL;');
   db.exec(SCHEMA);
   ensureColumns(db, 'products', {
     catalog_active: 'INTEGER NOT NULL DEFAULT 1',
@@ -258,8 +260,17 @@ export function upsertReviews(db, productId, reviews) {
     for (const review of reviews) {
       const reviewText = String(review.reviewText ?? '').trim();
       const variant = String(review.variant ?? '').trim();
+      const reviewerRegion = String(review.reviewerRegion ?? '').trim();
+      const rawReviewText = String(review.raw?.rawText ?? reviewText).trim();
       const fingerprint = review.contentFingerprint || crypto.createHash('sha256')
-        .update([review.reviewDate ?? '', review.rating ?? '', reviewText.toLowerCase(), variant.toLowerCase()].join('|'))
+        .update([
+          review.reviewDate ?? '',
+          review.rating ?? '',
+          reviewText.toLowerCase(),
+          variant.toLowerCase(),
+          reviewerRegion.toLowerCase(),
+          rawReviewText.toLowerCase()
+        ].join('|'))
         .digest('hex').slice(0, 32);
       const isDuplicate = review.isDuplicate ?? Boolean(duplicateLookup.get(productId, fingerprint, review.externalReviewId));
       const hasText = review.hasText ?? Boolean(reviewText);
@@ -269,7 +280,7 @@ export function upsertReviews(db, productId, reviews) {
         ? '字段不完整' : isDuplicate ? '疑似重复' : hasText ? '可用于分析' : '无正文');
       statement.run(
         productId, review.externalReviewId, review.reviewDate, review.rating, reviewText, variant,
-        String(review.reviewerRegion ?? ''), review.isTranslated ? 1 : 0, isDuplicate ? 1 : 0,
+        reviewerRegion, review.isTranslated ? 1 : 0, isDuplicate ? 1 : 0,
         hasText ? 1 : 0, hasImage ? 1 : 0, JSON.stringify(imageUrls), quality,
         String(review.sourceProductId ?? ''), fingerprint, review.sourceUrl,
         new Date().toISOString(), JSON.stringify(review.raw ?? {})

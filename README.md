@@ -83,7 +83,7 @@ node src/cli.mjs reviews --config config.json --batch-size 10 --include-reviewed
 - `2-重试失败评论并导表.cmd`
 - `3-仅重新导出Excel.cmd`
 
-采集 Chrome 是由运营台启动的可见普通 Chrome，使用独立且持久的资料目录。请人工完成 VPN、登录及验证码；程序不会绕过验证。不要连接或复制日常主浏览器资料目录。
+采集 Chrome 是由运营台启动的可见普通 Chrome，使用独立且持久的资料目录。VPN、登录、验证码、安全验证以及验证页刷新全部由运营人员人工完成；程序只识别并暂停，不点击、不刷新、不绕过验证。不要连接或复制日常主浏览器资料目录。
 
 ## 不访问Temu的本地验收
 
